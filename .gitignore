@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+*.sqlite3
+
+# Node / React
+node_modules/
+dist/
+.vite/
+*.log
+
+# Workspace storage (uploaded user projects output/temp)
+workspace/*
+!workspace/.gitkeep
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+temp_*
+*.png.gz
+*.gz
