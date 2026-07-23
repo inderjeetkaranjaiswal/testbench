@@ -25,6 +25,8 @@ export function ProjectProvider({ children }) {
     averageTimePerTest: 0,
     fastestTest: 0,
     slowestTest: 0,
+    fastestTestDetails: null,
+    slowestTestDetails: null,
     estimatedRemainingTime: 0,
     totalTestsRemaining: 0,
     completedTests: 0,

@@ -6,7 +6,7 @@ import LogisticsView from '../components/LogisticsView.jsx';
 import EmulatorView from '../components/EmulatorView.jsx';
 import TerminalView from '../components/TerminalView.jsx';
 import DeviceInfoPanel from '../components/DeviceInfoPanel.jsx';
-import ExecutionStatsPanel from '../components/ExecutionStatsPanel.jsx';
+import ExecutionSummaryCard from '../components/ExecutionSummaryCard.jsx';
 
 function DirectoryTreeNode({ node, level = 0 }) {
   const [isOpen, setIsOpen] = useState(level < 2);
@@ -128,10 +128,11 @@ export default function Dashboard() {
 
       {/* MASTER WORKBENCH RESPONSIVE CSS GRID */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* LEFT COLUMN: LogisticsView & Advanced Device Information */}
+        {/* LEFT COLUMN: LogisticsView, Advanced Device Information & Execution Summary */}
         <div className="lg:col-span-6 w-full space-y-6">
           <LogisticsView />
           <DeviceInfoPanel />
+          <ExecutionSummaryCard />
         </div>
 
         {/* RIGHT COLUMN: EmulatorView (Interactive 2-Way Mirror & Action Controls) */}

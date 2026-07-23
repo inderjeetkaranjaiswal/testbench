@@ -171,6 +171,32 @@ export default function TerminalView() {
         }
         setLogBuffer((prev) => [...prev, text]);
 
+        // Check for individual test time logs (e.g. "Time elapsed: 8.4 s -- in com.example.DashboardTest")
+        if (text.includes('Time elapsed:') && text.includes('s')) {
+          try {
+            const timeMatch = text.match(/Time elapsed:\s*([\d\.]+)\s*s/);
+            let className = targetFiles.length === 1 ? targetFiles[0].split('/').pop() : 'TestClass';
+            if (text.includes('-- in ')) {
+              const classMatch = text.split('-- in ')[1].trim();
+              const simpleName = classMatch.split('.').pop();
+              className = simpleName.endsWith('.java') ? simpleName : `${simpleName}.java`;
+            }
+
+            if (timeMatch) {
+              const dur = parseFloat(timeMatch[1]);
+              setExecutionStats((prev) => {
+                const fDet = (!prev.fastestTestDetails || dur < prev.fastestTestDetails.time) ? { name: className, time: dur } : prev.fastestTestDetails;
+                const sDet = (!prev.slowestTestDetails || dur > prev.slowestTestDetails.time) ? { name: className, time: dur } : prev.slowestTestDetails;
+                return {
+                  ...prev,
+                  fastestTestDetails: fDet,
+                  slowestTestDetails: sDet,
+                };
+              });
+            }
+          } catch (e) {}
+        }
+
         // Check for total duration in logs
         if (text.includes('[PROFILE] TOTAL PIPELINE EXECUTION DURATION:')) {
           try {
@@ -178,12 +204,16 @@ export default function TerminalView() {
             if (match) {
               const durSec = parseFloat(match[1]);
               const avg = durSec / Math.max(1, testCount);
+              const singleTestName = targetFiles.length > 0 ? targetFiles[0].split('/').pop() : 'TestClass.java';
+              
               setExecutionStats((prev) => ({
                 ...prev,
                 totalExecutionTime: durSec,
                 averageTimePerTest: avg,
                 fastestTest: prev.fastestTest === 0 ? avg : Math.min(prev.fastestTest, avg),
                 slowestTest: Math.max(prev.slowestTest, avg),
+                fastestTestDetails: prev.fastestTestDetails || { name: singleTestName, time: durSec },
+                slowestTestDetails: prev.slowestTestDetails || { name: singleTestName, time: durSec },
                 estimatedRemainingTime: 0,
                 totalTestsRemaining: 0,
               }));
