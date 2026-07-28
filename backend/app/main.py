@@ -3,9 +3,10 @@ import sys
 import shutil
 import asyncio
 import zipfile
+import datetime
 from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,13 +19,16 @@ from app.services.adb_bridge import (
     execute_device_control_async,
     get_advanced_device_info_async
 )
-from app.services.runner import run_test_process_websocket, resolve_test_command
+from app.services.runner import run_test_background, resolve_test_command
+from app.services.db import init_db, get_latest_execution_status
 
 if sys.platform == 'win32':
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
+
+init_db()
 
 app = FastAPI(
     title="TestBench Backend API",
@@ -458,33 +462,82 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@app.websocket("/ws/execute/{project_name}")
-async def websocket_execute_test(websocket: WebSocket, project_name: str, test_file: Optional[str] = None):
-
+@app.post("/api/execute/{project_name}")
+async def execute_test_endpoint(
+    project_name: str,
+    background_tasks: BackgroundTasks,
+    test_file: Optional[str] = None
+):
     """
-    WebSocket route for executing project tests.
-    Spawns test process inside workspace/{project_name} and streams stdout/stderr in real-time.
+    Triggers test execution asynchronously via FastAPI BackgroundTasks.
+    Redirects stdout/stderr directly into workspace/logs/{project_name}_{timestamp}.log.
     """
-    await websocket.accept()
     target_dir = WORKSPACE_DIR / project_name
-
     if not target_dir.exists() or not target_dir.is_dir():
-        await websocket.send_text(f"[RUNNER ERROR] Project directory '{project_name}' not found in workspace.")
-        await websocket.close(code=4004)
-        return
+        raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found in workspace.")
+
+    background_tasks.add_task(run_test_background, str(target_dir), project_name, test_file)
+
+    return {
+        "status": "queued",
+        "message": f"Test execution queued for project '{project_name}'",
+        "project_name": project_name,
+    }
+
+
+@app.get("/api/status/{project_name}")
+async def get_execution_status_endpoint(project_name: str):
+    """Returns current execution status flag ('Idle', 'Running', 'Completed', 'Failed') and details."""
+    return get_latest_execution_status(project_name)
+
+
+@app.get("/api/logs/{project_name}")
+async def list_project_logs(project_name: str):
+    """Lists available log files stored in workspace/logs/ for project_name."""
+    logs_dir = WORKSPACE_DIR / "logs"
+    if not logs_dir.exists():
+        return {"project_name": project_name, "logs": []}
+
+    log_files = []
+    prefix = f"{project_name}_"
+    for f in sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if f.name.startswith(prefix) or f.name == f"{project_name}.log":
+            log_files.append({
+                "filename": f.name,
+                "size_bytes": f.stat().st_size,
+                "created_at": datetime.datetime.fromtimestamp(f.stat().st_ctime, datetime.timezone.utc).isoformat(),
+                "download_url": f"/api/logs/{project_name}/{f.name}"
+            })
+
+    return {"project_name": project_name, "logs": log_files}
+
+
+@app.get("/api/logs/{project_name}/{filename}")
+async def get_log_file_endpoint(project_name: str, filename: str, download: bool = False):
+    """Returns content of specified log file or downloads it as plain text."""
+    logs_dir = WORKSPACE_DIR / "logs"
+    file_path = logs_dir / filename
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Log file '{filename}' not found.")
+
+    if download:
+        return FileResponse(
+            path=file_path,
+            media_type="text/plain",
+            filename=filename
+        )
 
     try:
-        await run_test_process_websocket(str(target_dir), websocket, test_file=test_file)
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        return {
+            "project_name": project_name,
+            "filename": filename,
+            "content": content,
+            "size_bytes": file_path.stat().st_size
+        }
     except Exception as e:
-        try:
-            await websocket.send_text(f"[RUNNER ERROR] Execution exception: {str(e)}")
-        except Exception:
-            pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        raise HTTPException(status_code=500, detail=f"Failed to read log file: {str(e)}")
 
 
 from app.services.adb_bridge import stream_emulator_frames

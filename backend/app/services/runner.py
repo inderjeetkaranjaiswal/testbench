@@ -52,8 +52,8 @@ def clean_offline_and_get_online_adb_device(adb_bin: str) -> Optional[str]:
         if res.returncode == 0 and res.stdout:
             for line in res.stdout.splitlines():
                 line = line.strip()
-                if line and not line.startswith("List of") and "\t" in line:
-                    parts = line.split("\t")
+                if line and not line.startswith("List of"):
+                    parts = line.split()
                     if len(parts) >= 2 and parts[1].strip() == "device":
                         return parts[0].strip()
     except Exception:
@@ -336,154 +336,196 @@ async def ensure_appium_server_running(websocket: Optional[WebSocket] = None) ->
     return False
 
 
-async def run_test_process_websocket(
-    project_path: str,
-    websocket: WebSocket,
-    test_file: Optional[str] = None
-) -> int:
+import datetime
+from app.services.db import start_execution, update_execution_status
+
+
+def ensure_appium_server_sync(log_file=None) -> bool:
     """
-    Spawns the test process sequentially via execution lock, starts Excel report watchdog,
-    streams stdout/stderr in real-time, sends WebSocket keep-alive heartbeats,
-    and guarantees process & watchdog cleanup on completion or disconnect.
+    Checks if Appium server is active on http://127.0.0.1:4723/status.
+    If not running, automatically spawns an Appium server background process.
     """
-    async with _execution_lock:
-        start_pipeline_time = time.time()
-        
-        t0 = time.time()
-        project_root, framework = find_project_root(project_path)
-        t_detect = time.time() - t0
+    import urllib.request
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request("http://127.0.0.1:4723/status")
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    if log_file:
+                        log_file.write("[APPIUM] Appium Server active on 127.0.0.1:4723\n")
+                        log_file.flush()
+                    return True
+        except Exception:
+            pass
 
-        executable, args = resolve_test_args(project_path, test_file)
-        project_name = Path(project_path).name
-        cmd_str = " ".join(args)
+    if log_file:
+        log_file.write("[APPIUM] Appium Server not active on 127.0.0.1:4723. Auto-launching Appium Server...\n")
+        log_file.flush()
 
-        await websocket.send_text(f"[RUNNER] Target project: {project_name}")
-        await websocket.send_text(f"[RUNNER] Executing command: {cmd_str}")
-        await websocket.send_text(f"[RUNNER] Working directory: {project_root}")
-        await websocket.send_text(f"[PROFILE] 1. Project Detection & Command Resolution: {t_detect:.3f}s")
-        await websocket.send_text("--------------------------------------------------")
+    npx_bin = shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
-        # Automatically launch Appium server & install APK if executing Maven/Appium mobile automation
-        if framework == "maven":
-            t_appium_start = time.time()
-            await ensure_appium_server_running(websocket)
-            t_appium = time.time() - t_appium_start
-            await websocket.send_text(f"[PROFILE] 2. Appium Server Status Check: {t_appium:.3f}s")
-
-            t_apk_start = time.time()
-            apk_success = await ensure_apk_installed(project_root, websocket)
-            t_apk = time.time() - t_apk_start
-            await websocket.send_text(f"[PROFILE] 3. APK Installation Check & Verification: {t_apk:.3f}s")
-
-            if not apk_success:
-                await websocket.send_text("--------------------------------------------------")
-                await websocket.send_text("[RUNNER FINISHED] Execution aborted due to APK installation failure.")
-                return -1
-
-        loop = asyncio.get_running_loop()
-
-        async def on_report_generated(payload: dict):
+    try:
+        subprocess.Popen(
+            [npx_bin, "appium", "--port", "4723", "--relaxed-security"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags
+        )
+        for _ in range(16):
+            time.sleep(0.5)
             try:
-                await websocket.send_text(json.dumps(payload))
-                await websocket.send_text(
-                    f"[WATCHDOG] Excel Report Generated: {payload['file_name']} -> {payload['download_url']}"
-                )
+                req = urllib.request.Request("http://127.0.0.1:4723/status")
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if resp.status == 200:
+                        if log_file:
+                            log_file.write("[APPIUM] Appium Server started successfully on port 4723!\n")
+                            log_file.flush()
+                        return True
             except Exception:
                 pass
+    except Exception as e:
+        if log_file:
+            log_file.write(f"[APPIUM WARNING] Could not auto-launch Appium server: {e}\n")
+            log_file.flush()
 
-        watcher = ExcelReportWatcher(str(project_root), project_name, loop, on_report_generated)
-        watcher.start()
+    return False
 
-        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        process = None
 
-        # Keep-alive heartbeat background worker to prevent WebSocket timeouts during long runs
-        keep_alive_running = True
+def ensure_apk_installed_sync(project_root: Path, log_file=None) -> bool:
+    """
+    Scans project for .apk files and installs onto active ADB device if not already verified.
+    """
+    global _installed_apks_cache
+    apk_files = [p for p in project_root.rglob("*.apk") if "target" not in p.parts]
+    if not apk_files:
+        return True
 
-        async def keep_alive_worker():
-            while keep_alive_running:
-                await asyncio.sleep(10)
-                if keep_alive_running:
-                    try:
-                        await websocket.send_text("[KEEPALIVE] Pipeline active.")
-                    except Exception:
-                        break
+    adb_bin = find_adb_executable() or "adb"
 
-        keep_alive_task = asyncio.create_task(keep_alive_worker())
+    for apk_path in apk_files:
+        apk_key = str(apk_path.resolve())
+        if apk_key in _installed_apks_cache:
+            if log_file:
+                log_file.write(f"[ADB] Found APK in project: {apk_path.name}\n")
+                log_file.write(f"[ADB SUCCESS] Package is ALREADY installed/verified for this session.\n")
+                log_file.flush()
+            continue
 
-        t_spawn_start = time.time()
+        device_id = clean_offline_and_get_online_adb_device(adb_bin)
+        pkg_name = extract_apk_package_name(apk_path)
+        if pkg_name:
+            installed = is_package_installed_on_device(adb_bin, device_id, pkg_name)
+            if installed:
+                _installed_apks_cache.add(apk_key)
+                if log_file:
+                    log_file.write(f"[ADB] Found APK in project: {apk_path.name}\n")
+                    log_file.write(f"[ADB SUCCESS] Package '{pkg_name}' is ALREADY installed on target device.\n")
+                    log_file.flush()
+                continue
+
+        cmd = [adb_bin]
+        if device_id:
+            cmd.extend(["-s", device_id])
+        cmd.extend(["install", "-r", "-t", str(apk_path)])
+
+        if log_file:
+            log_file.write(f"[ADB] Executing install command for {apk_path.name}...\n")
+            log_file.flush()
+
         try:
-            process = await asyncio.to_thread(
-                subprocess.Popen,
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30.0, creationflags=creation_flags)
+            combined_out = (res.stdout or "") + (res.stderr or "")
+
+            if res.returncode == 0 or "Success" in combined_out:
+                _installed_apks_cache.add(apk_key)
+                if log_file:
+                    log_file.write(f"[ADB SUCCESS] Successfully installed {apk_path.name}\n")
+                    log_file.flush()
+            else:
+                if log_file:
+                    log_file.write(f"[ADB ERROR] Failed to install {apk_path.name}: {combined_out}\n")
+                    log_file.flush()
+                return False
+        except Exception as e:
+            if log_file:
+                log_file.write(f"[ADB ERROR] Exception during adb install: {e}\n")
+                log_file.flush()
+            return False
+
+    return True
+
+
+def run_test_background(
+    project_path: str,
+    project_name: str,
+    test_file: Optional[str] = None
+):
+    """
+    Executes tests asynchronously in background task, redirecting stdout/stderr directly
+    into /backend/workspace/logs/{project_name}_{timestamp}.log and updating SQLite status.
+    """
+    project_root, framework = find_project_root(project_path)
+    workspace_dir = project_root.parent
+    logs_dir = workspace_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"{project_name}_{timestamp}.log"
+    log_file_path = logs_dir / log_filename
+
+    execution_id = start_execution(project_name, log_filename)
+
+    executable, args = resolve_test_args(project_path, test_file)
+    cmd_str = " ".join(args)
+
+    with open(log_file_path, "w", encoding="utf-8") as f:
+        f.write(f"==================================================\n")
+        f.write(f"[RUNNER] Target project: {project_name}\n")
+        f.write(f"[RUNNER] Executing command: {cmd_str}\n")
+        f.write(f"[RUNNER] Working directory: {project_root}\n")
+        f.write(f"[RUNNER] Output Log: {log_filename}\n")
+        f.write(f"==================================================\n\n")
+        f.flush()
+
+        try:
+            if framework == "maven":
+                ensure_appium_server_sync(f)
+                apk_success = ensure_apk_installed_sync(project_root, f)
+                if not apk_success:
+                    f.write("\n[RUNNER ERROR] Aborting execution due to APK installation failure.\n")
+                    f.flush()
+                    update_execution_status(execution_id, "Failed", exit_code=-1)
+                    return
+
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+            proc = subprocess.Popen(
                 args,
                 cwd=str(project_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=f,
+                stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
                 creationflags=creation_flags
             )
-            t_spawn = time.time() - t_spawn_start
-            await websocket.send_text(f"[PROFILE] 4. Subprocess Spawn: {t_spawn:.3f}s")
-        except Exception as e:
-            keep_alive_running = False
-            keep_alive_task.cancel()
-            watcher.stop()
-            error_msg = f"[RUNNER ERROR] Failed to spawn process: {type(e).__name__} - {str(e)}"
-            await websocket.send_text(error_msg)
-            return -1
 
-        try:
-            async def read_stream_thread(stream, is_stderr=False):
-                while True:
-                    line = await asyncio.to_thread(stream.readline)
-                    if not line:
-                        break
-                    text = line.rstrip()
-                    if text:
-                        prefix = "[STDERR] " if is_stderr else ""
-                        try:
-                            await websocket.send_text(f"{prefix}{text}")
-                        except Exception:
-                            break
+            exit_code = proc.wait()
 
-            await asyncio.gather(
-                read_stream_thread(process.stdout, is_stderr=False),
-                read_stream_thread(process.stderr, is_stderr=True)
-            )
+            f.write(f"\n==================================================\n")
+            f.write(f"[RUNNER FINISHED] Process exited with code {exit_code}\n")
+            f.write(f"==================================================\n")
+            f.flush()
 
-            exit_code = await asyncio.to_thread(process.wait)
-            total_duration = time.time() - start_pipeline_time
-            status_msg = f"[RUNNER FINISHED] Process exited with code {exit_code}"
-            try:
-                await websocket.send_text("--------------------------------------------------")
-                await websocket.send_text(f"[PROFILE] TOTAL PIPELINE EXECUTION DURATION: {total_duration:.2f}s")
-                await websocket.send_text(status_msg)
-            except Exception:
-                pass
-
-            return exit_code
+            if exit_code == 0:
+                update_execution_status(execution_id, "Completed", exit_code=0)
+            else:
+                update_execution_status(execution_id, "Failed", exit_code=exit_code)
 
         except Exception as e:
-            try:
-                await websocket.send_text(f"[RUNNER EXCEPTION] Execution interrupted: {e}")
-            except Exception:
-                pass
-            return -1
+            f.write(f"\n[RUNNER EXCEPTION] Execution error: {e}\n")
+            f.flush()
+            update_execution_status(execution_id, "Failed", exit_code=-1)
 
-        finally:
-            keep_alive_running = False
-            keep_alive_task.cancel()
-            watcher.stop()
-
-            # Ensure process termination on disconnect or abort
-            if process and process.poll() is None:
-                try:
-                    process.terminate()
-                    await asyncio.sleep(0.5)
-                    if process.poll() is None:
-                        process.kill()
-                except Exception as clean_err:
-                    print(f"[RUNNER CLEANUP WARNING] Process cleanup: {clean_err}")
 
 

@@ -100,8 +100,8 @@ async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False
             # Disconnect stale offline devices
             for line in lines:
                 line = line.strip()
-                if "\t" in line:
-                    parts = line.split("\t")
+                if line and not line.startswith("List of"):
+                    parts = line.split()
                     if len(parts) >= 2 and parts[1].strip() == "offline":
                         device_address = parts[0].strip()
                         if ":" in device_address:
@@ -126,8 +126,8 @@ async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False
             if proc2.returncode == 0 and out_text2:
                 for line in out_text2.splitlines():
                     line = line.strip()
-                    if line and not line.startswith("List of") and "\t" in line:
-                        parts = line.split("\t")
+                    if line and not line.startswith("List of"):
+                        parts = line.split()
                         if len(parts) >= 2 and parts[1].strip() == "device":
                             _cached_device_id = parts[0].strip()
                             return _cached_device_id

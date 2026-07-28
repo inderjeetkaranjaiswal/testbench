@@ -4,7 +4,7 @@ import { Activity, Server, FolderGit2, CheckCircle2, RefreshCw, Upload, Rocket, 
 import { useProject } from '../context/ProjectContext.jsx';
 import LogisticsView from '../components/LogisticsView.jsx';
 import EmulatorView from '../components/EmulatorView.jsx';
-import TerminalView from '../components/TerminalView.jsx';
+import ExecutionHistory from '../components/ExecutionHistory.jsx';
 import DeviceInfoPanel from '../components/DeviceInfoPanel.jsx';
 import ExecutionSummaryCard from '../components/ExecutionSummaryCard.jsx';
 
@@ -140,9 +140,9 @@ export default function Dashboard() {
           <EmulatorView />
         </div>
 
-        {/* ENTIRE BOTTOM ROW: TerminalView (Xterm.js Live Streaming Logs Console) */}
-        <div className="lg:col-span-12 w-full h-[500px]">
-          <TerminalView />
+        {/* ENTIRE BOTTOM ROW: ExecutionHistory (Log Files & Background Execution Status) */}
+        <div className="lg:col-span-12 w-full">
+          <ExecutionHistory />
         </div>
       </div>
     </div>
