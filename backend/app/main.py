@@ -17,9 +17,13 @@ from app.services.adb_bridge import (
     stream_emulator_frames,
     find_adb_executable,
     execute_device_control_async,
-    get_advanced_device_info_async
+    get_advanced_device_info_async,
+    list_all_devices_and_emulators_async,
+    start_emulator_async,
+    stop_emulator_async,
+    execute_emulator_control_async
 )
-from app.services.runner import run_test_background, resolve_test_command
+from app.services.runner import run_test_background, run_test_process_websocket, resolve_test_command, get_active_session
 from app.services.db import init_db, get_latest_execution_status
 
 if sys.platform == 'win32':
@@ -36,16 +40,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Enable CORS for Frontend React app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Root workspace directory path
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,8 +62,6 @@ class SystemStatus(BaseModel):
 
 @app.get("/api/health", response_model=SystemStatus)
 async def health_check():
-    """Returns the current operational status of the TestBench backend."""
-    # Count directories in workspace
     project_count = 0
     if WORKSPACE_DIR.exists():
         project_count = len([p for p in WORKSPACE_DIR.iterdir() if p.is_dir()])
@@ -74,9 +74,14 @@ async def health_check():
     )
 
 
+@app.get("/api/execution/session")
+async def get_execution_session_endpoint():
+    """Returns the current Single Source of Truth execution session state."""
+    return get_active_session()
+
+
 @app.get("/api/workspace/files")
 async def list_workspace_files():
-    """Lists files and folders inside the root workspace/ directory."""
     if not WORKSPACE_DIR.exists():
         return {"items": []}
 
@@ -95,7 +100,6 @@ async def list_workspace_files():
 
 @app.post("/api/workspace/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Uploads a user project file into the root workspace/ directory."""
     destination = WORKSPACE_DIR / file.filename
     try:
         with destination.open("wb") as buffer:
@@ -113,13 +117,10 @@ BLOAT_ITEMS = {".git", ".idea", ".mvn", "target", ".DS_Store", "node_modules"}
 
 
 def sanitize_directory(target_dir: Path) -> List[str]:
-    """Recursively scans target_dir and removes bloat items (.git, .idea, .mvn, target, .DS_Store, node_modules)."""
     removed_items = []
-    # Walk bottom-up so nested bloat directories get deleted cleanly
     for root, dirs, files in os.walk(target_dir, topdown=False):
         current_root = Path(root)
 
-        # Remove matching files
         for f in files:
             if f in BLOAT_ITEMS:
                 file_path = current_root / f
@@ -129,7 +130,6 @@ def sanitize_directory(target_dir: Path) -> List[str]:
                 except Exception as e:
                     print(f"Error deleting file {file_path}: {e}")
 
-        # Remove matching directories
         for d in dirs:
             if d in BLOAT_ITEMS:
                 dir_path = current_root / d
@@ -146,7 +146,6 @@ IGNORED_TREE_ITEMS = {".git", ".idea", ".mvn", "target", ".DS_Store", "node_modu
 
 
 def build_directory_tree(path: Path) -> dict:
-    """Recursively builds a tree dictionary representation for a directory path."""
     if path.is_file():
         return {
             "name": path.name,
@@ -172,10 +171,6 @@ def build_directory_tree(path: Path) -> dict:
 
 
 def auto_patch_maven_pom(target_dir: Path):
-    """
-    Scans target_dir for pom.xml files. Ensures surefire plugin includes classesDirectory & testClassesDirectory
-    pointing to target/classes and configures reuseForks=true so JVM stays warm across test classes.
-    """
     for pom_file in target_dir.rglob("pom.xml"):
         try:
             content = pom_file.read_text(encoding="utf-8", errors="ignore")
@@ -201,27 +196,19 @@ def auto_patch_maven_pom(target_dir: Path):
             print(f"[POM Auto-Patch Warning] {e}")
 
 
-
 @app.post("/api/upload")
 async def upload_and_sanitize_zip(file: UploadFile = File(...)):
-    """
-    Extracts a .zip file upload into a unique folder inside workspace/,
-    sanitizes bloat folders/files (.git, .idea, .mvn, target, .DS_Store, node_modules),
-    and returns a JSON response with the sanitized project path and directory tree.
-    """
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(
             status_code=400,
             detail="Invalid file format. Please upload a .zip archive."
         )
 
-    # Derive clean project name from zip filename
     raw_name = Path(file.filename).stem
     project_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw_name)
     if not project_name:
         project_name = "project"
 
-    # Create a unique target directory inside workspace/
     target_dir = WORKSPACE_DIR / project_name
     counter = 1
     while target_dir.exists():
@@ -231,23 +218,18 @@ async def upload_and_sanitize_zip(file: UploadFile = File(...)):
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Save temporary zip file inside target directory
         temp_zip_path = target_dir / "_temp_upload.zip"
         with temp_zip_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Extract zip content into target_dir
         with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
             zip_ref.extractall(target_dir)
 
-        # Clean up temporary zip file
         temp_zip_path.unlink(missing_ok=True)
 
-        # Execute automated sanitization & pom auto-patching
         deleted_bloat = sanitize_directory(target_dir)
         auto_patch_maven_pom(target_dir)
 
-        # Build directory tree and run project scanner
         dir_tree = build_directory_tree(target_dir)
         inspection = inspect_project(str(target_dir))
 
@@ -274,7 +256,6 @@ async def upload_and_sanitize_zip(file: UploadFile = File(...)):
 
 @app.get("/api/projects")
 async def list_projects():
-    """Returns a list of all uploaded projects stored inside workspace/ with detected frameworks."""
     if not WORKSPACE_DIR.exists():
         return {"projects": []}
 
@@ -296,7 +277,6 @@ async def list_projects():
 
 @app.get("/api/projects/{project_name}")
 async def get_project_details(project_name: str):
-    """Returns detected framework type and array of test file relative paths for a specific project."""
     target_dir = WORKSPACE_DIR / project_name
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found in workspace.")
@@ -315,7 +295,6 @@ async def get_project_details(project_name: str):
 
 @app.get("/api/reports/{project_name}/{filename}")
 async def get_excel_report(project_name: str, filename: str):
-    """Serves the generated Excel file from the project's workspace directory."""
     project_dir = WORKSPACE_DIR / project_name
     if not project_dir.exists() or not project_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found in workspace.")
@@ -341,11 +320,6 @@ async def get_excel_report(project_name: str, filename: str):
 
 @app.get("/api/analytics/{project_name}")
 async def get_project_analytics(project_name: str):
-    """
-    Parses Maven Surefire XML test reports for the given project in workspace/
-    and returns a JSON object with passed, failed, and skipped test metrics.
-    Safely returns zeros if reports haven't generated yet or tests are active.
-    """
     project_dir = WORKSPACE_DIR / project_name
     if not project_dir.exists() or not project_dir.is_dir():
         return {"passed": 0, "failed": 0, "skipped": 0, "total": 0}
@@ -376,9 +350,6 @@ SPEED_MAPPING = {
 
 @app.post("/api/network/throttle")
 async def throttle_network(req: ThrottleRequest):
-    """
-    Dynamically throttles the Android Virtual Device network speed using ADB emulator commands.
-    """
     raw_speed = req.speed.lower()
     adb_speed = SPEED_MAPPING.get(raw_speed, raw_speed)
 
@@ -417,31 +388,80 @@ async def throttle_network(req: ThrottleRequest):
         }
 
 
+@app.get("/api/devices")
+async def list_devices_endpoint():
+    return await list_all_devices_and_emulators_async()
+
+
+class StartEmulatorRequest(BaseModel):
+    avd_name: str
+
+
+@app.post("/api/emulator/start")
+async def start_emulator_endpoint(req: StartEmulatorRequest):
+    result = await start_emulator_async(req.avd_name)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("message", "Failed to start emulator"))
+    return result
+
+
+class StopEmulatorRequest(BaseModel):
+    device_id: str
+
+
+@app.post("/api/emulator/stop")
+async def stop_emulator_endpoint(req: StopEmulatorRequest):
+    result = await stop_emulator_async(req.device_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("message", "Failed to stop emulator"))
+    return result
+
+
+class EmulatorControlRequest(BaseModel):
+    action: str
+    device_id: Optional[str] = None
+    params: Optional[dict] = None
+
+
+@app.post("/api/emulator/control")
+async def emulator_control_endpoint(req: EmulatorControlRequest):
+    result = await execute_emulator_control_async(req.action, target_device_id=req.device_id, params=req.params)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message", "Emulator control action failed"))
+    return result
+
+
 class DeviceControlRequest(BaseModel):
     action: str
+    device_id: Optional[str] = None
     params: Optional[dict] = None
 
 
 @app.post("/api/device/control")
 async def device_control_endpoint(req: DeviceControlRequest):
-    """
-    Executes real-time touch, gesture, hardware button, or input commands on the connected Android device via ADB.
-    """
-    result = await execute_device_control_async(req.action, req.params or {})
+    result = await execute_device_control_async(req.action, params=req.params or {}, target_device_id=req.device_id)
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("message", "Device control execution failed"))
     return result
 
 
 @app.get("/api/device/info")
-async def device_info_endpoint():
-    """
-    Returns comprehensive hardware details, battery metrics, connection status, network stats, and live runtime status.
-    """
-    return await get_advanced_device_info_async()
+async def device_info_endpoint(device_id: Optional[str] = None):
+    return await get_advanced_device_info_async(target_device_id=device_id)
 
 
-# Connection manager for WebSockets
+@app.post("/api/emulator/open-studio")
+async def open_android_studio_endpoint():
+    try:
+        if os.name == 'posix':
+            subprocess.Popen(["open", "-a", "Android Studio"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif os.name == 'nt':
+            subprocess.Popen(["cmd", "/c", "start", "studio64.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"status": "success", "message": "Launching Android Studio..."}
+    except Exception as e:
+        return {"status": "error", "message": f"Please open Android Studio manually: {str(e)}"}
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -483,6 +503,30 @@ async def execute_test_endpoint(
         "message": f"Test execution queued for project '{project_name}'",
         "project_name": project_name,
     }
+
+
+@app.websocket("/ws/execute/{project_name}")
+async def websocket_execute_test(websocket: WebSocket, project_name: str, test_file: Optional[str] = None, device_id: Optional[str] = None):
+    await websocket.accept()
+    target_dir = WORKSPACE_DIR / project_name
+
+    if not target_dir.exists() or not target_dir.is_dir():
+        await websocket.send_text(f"[RUNNER ERROR] Project directory '{project_name}' not found in workspace.")
+        await websocket.close(code=4004)
+        return
+
+    try:
+        await run_test_process_websocket(str(target_dir), websocket, test_file=test_file, device_id=device_id)
+    except Exception as e:
+        try:
+            await websocket.send_text(f"[RUNNER ERROR] Execution exception: {str(e)}")
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.get("/api/status/{project_name}")
@@ -540,30 +584,22 @@ async def get_log_file_endpoint(project_name: str, filename: str, download: bool
         raise HTTPException(status_code=500, detail=f"Failed to read log file: {str(e)}")
 
 
-from app.services.adb_bridge import stream_emulator_frames
-
-
 @app.websocket("/ws/emulator")
-async def websocket_emulator_stream(websocket: WebSocket):
-    """
-    WebSocket endpoint for streaming Android ADB device screen (25-30 FPS).
-    """
+async def websocket_emulator_stream(websocket: WebSocket, device_id: Optional[str] = None):
     await websocket.accept()
     try:
-        await stream_emulator_frames(websocket, fps=30)
+        await stream_emulator_frames(websocket, fps=30, target_device_id=device_id)
     except Exception as e:
         print(f"[WS Emulator Error] {e}")
 
 
 @app.websocket("/ws/logs")
 async def websocket_endpoint(websocket: WebSocket):
-    """Real-time log and notification WebSocket connection."""
     await manager.connect(websocket)
     try:
         await websocket.send_text("TestBench WebSocket connected.")
         while True:
             data = await websocket.receive_text()
-            # Echo or process client message
             await websocket.send_text(f"Event received: {data}")
     except WebSocketDisconnect:
         manager.disconnect(websocket)

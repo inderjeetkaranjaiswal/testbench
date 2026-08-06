@@ -13,6 +13,21 @@ export function ProjectProvider({ children }) {
   const [loadingTests, setLoadingTests] = useState(false);
   const [generatedReport, setGeneratedReport] = useState(null);
   
+  // Single Source of Truth Execution Session State
+  const [executionSession, setExecutionSession] = useState({
+    execution_id: '',
+    project_id: '',
+    selected_test: '',
+    device_id: '',
+    current_module: 'Dashboard',
+    current_screen: 'Services',
+    status: 'IDLE',
+    progress: 0,
+    start_time: 0,
+    last_action: '',
+    error_message: ''
+  });
+
   // Interactive Mirroring & Execution Telemetry States
   const [operatingMode, setOperatingMode] = useState('view'); // 'view' | 'interactive'
   const [isExecuting, setIsExecuting] = useState(false);
@@ -33,9 +48,105 @@ export function ProjectProvider({ children }) {
     totalTests: 0,
   });
 
+  // Device Selection & Emulator Management States
+  const [devicesList, setDevicesList] = useState({ real_devices: [], emulators: [] });
+  const [selectedDevice, setSelectedDevice] = useState(null);
+  const [loadingDevices, setLoadingDevices] = useState(false);
+  const [startingEmulator, setStartingEmulator] = useState(null);
+
+  const fetchExecutionSession = async () => {
+    try {
+      const res = await fetch('/api/execution/session');
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.execution_id) {
+          setExecutionSession(data);
+          setIsExecuting(data.status === 'RUNNING');
+        }
+      }
+    } catch (err) {}
+  };
+
+  const fetchDevicesList = async () => {
+    setLoadingDevices(true);
+    try {
+      const res = await fetch('/api/devices');
+      if (res.ok) {
+        const data = await res.json();
+        setDevicesList(data);
+
+        setSelectedDevice((prev) => {
+          if (prev) {
+            const foundReal = (data.real_devices || []).find((d) => d.id === prev.id);
+            if (foundReal) return foundReal;
+            const foundEmu = (data.emulators || []).find((e) => (e.id && e.id === prev.id) || e.avd_name === prev.avd_name);
+            if (foundEmu) return foundEmu;
+          }
+
+          if (data.real_devices && data.real_devices.length > 0) {
+            return data.real_devices[0];
+          }
+          const pixel6aRunning = (data.emulators || []).find(
+            (e) => e.status === 'running' && (e.avd_name === 'Pixel_6a' || e.name?.toLowerCase().includes('pixel 6a'))
+          );
+          if (pixel6aRunning) return pixel6aRunning;
+
+          const runningEmu = (data.emulators || []).find((e) => e.status === 'running');
+          if (runningEmu) return runningEmu;
+
+          const pixel6aAvd = (data.emulators || []).find(
+            (e) => e.avd_name === 'Pixel_6a' || e.name?.toLowerCase().includes('pixel 6a')
+          );
+          if (pixel6aAvd) return pixel6aAvd;
+
+          if (data.emulators && data.emulators.length > 0) {
+            return data.emulators[0];
+          }
+          return null;
+        });
+      }
+    } catch (err) {
+      console.error('Failed to fetch devices list:', err);
+    } finally {
+      setLoadingDevices(false);
+    }
+  };
+
+  const startEmulator = async (avdName) => {
+    setStartingEmulator(avdName);
+    try {
+      const res = await fetch('/api/emulator/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ avd_name: avdName }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        await fetchDevicesList();
+        if (data.device_id) {
+          setSelectedDevice({
+            id: data.device_id,
+            name: avdName.replace(/_/g, ' '),
+            avd_name: avdName,
+            status: 'running',
+            type: 'emulator',
+          });
+        }
+        return { success: true, message: data.message };
+      } else {
+        return { success: false, message: data.detail || 'Failed to start emulator' };
+      }
+    } catch (err) {
+      return { success: false, message: err.message };
+    } finally {
+      setStartingEmulator(null);
+    }
+  };
+
   const fetchDeviceInfo = async () => {
     try {
-      const res = await fetch('/api/device/info');
+      const queryId = selectedDevice?.id ? `?device_id=${encodeURIComponent(selectedDevice.id)}` : '';
+      const res = await fetch(`/api/device/info${queryId}`);
       if (res.ok) {
         const data = await res.json();
         setDeviceInfo(data);
@@ -46,10 +157,16 @@ export function ProjectProvider({ children }) {
   };
 
   useEffect(() => {
+    fetchDevicesList();
     fetchDeviceInfo();
-    const interval = setInterval(fetchDeviceInfo, 4000);
+    fetchExecutionSession();
+    const interval = setInterval(() => {
+      fetchDevicesList();
+      fetchDeviceInfo();
+      fetchExecutionSession();
+    }, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedDevice?.id]);
 
   const login = (email, password) => {
     if (email === 'callhealth@12' && password === 'AKM12') {
@@ -119,7 +236,7 @@ export function ProjectProvider({ children }) {
     setSelectedTest(null);
     setSelectedTests([]);
     setRunTarget('all');
-    setGeneratedReport(null); // Reset generated report on project switch
+    setGeneratedReport(null);
 
     if (typeof project === 'object') {
       setActiveProject(project);
@@ -196,8 +313,18 @@ export function ProjectProvider({ children }) {
         deviceInfo,
         setDeviceInfo,
         fetchDeviceInfo,
+        devicesList,
+        setDevicesList,
+        selectedDevice,
+        setSelectedDevice,
+        fetchDevicesList,
+        startEmulator,
+        startingEmulator,
+        loadingDevices,
         executionStats,
         setExecutionStats,
+        executionSession,
+        setExecutionSession,
       }}
     >
       {children}

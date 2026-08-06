@@ -20,13 +20,15 @@ import {
   AlertTriangle,
   ShieldCheck,
   Send,
-  X
+  X,
+  MonitorPlay,
+  Settings
 } from 'lucide-react';
 import TelemetryBar from './TelemetryBar.jsx';
 import { useProject } from '../context/ProjectContext.jsx';
 
 export default function EmulatorView() {
-  const { operatingMode, setOperatingMode, isExecuting } = useProject();
+  const { operatingMode, setOperatingMode, isExecuting, selectedDevice, startEmulator, fetchDevicesList } = useProject();
 
   const [frameSrc, setFrameSrc] = useState(null);
   const [connected, setConnected] = useState(false);
@@ -37,9 +39,8 @@ export default function EmulatorView() {
   const [showTextInput, setShowTextInput] = useState(false);
   const [inputText, setInputText] = useState('');
   const [rotationDegree, setRotationDegree] = useState(0);
-  const [isLocked, setIsLocked] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
   const [lastActionStatus, setLastActionStatus] = useState('');
+  const [selectedResolution, setSelectedResolution] = useState('1080x2400');
 
   const wsRef = useRef(null);
   const frameCountRef = useRef(0);
@@ -58,7 +59,8 @@ export default function EmulatorView() {
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/emulator`;
+    const deviceQuery = selectedDevice?.id ? `?device_id=${encodeURIComponent(selectedDevice.id)}` : '';
+    const wsUrl = `${protocol}//${window.location.host}/ws/emulator${deviceQuery}`;
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -98,7 +100,7 @@ export default function EmulatorView() {
     }
   };
 
-  // FPS ticker
+  // FPS ticker & Re-connect when selected device changes
   useEffect(() => {
     connectWebSocket();
 
@@ -113,7 +115,7 @@ export default function EmulatorView() {
         wsRef.current.close();
       }
     };
-  }, []);
+  }, [selectedDevice?.id]);
 
   // Helper to send backend ADB control API requests
   const sendControlAction = async (action, params = {}) => {
@@ -127,7 +129,7 @@ export default function EmulatorView() {
       const res = await fetch('/api/device/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, params }),
+        body: JSON.stringify({ action, device_id: selectedDevice?.id, params }),
       });
       if (res.ok) {
         setLastActionStatus(`Action '${action}' OK`);
@@ -341,6 +343,100 @@ export default function EmulatorView() {
       {lastActionStatus && !isExecuting && (
         <div className="w-full bg-slate-900 text-emerald-400 font-mono text-[11px] px-3 py-1 rounded-custom flex items-center justify-between">
           <span>[ADB CONTROL] {lastActionStatus}</span>
+        </div>
+      )}
+
+      {/* Emulator Controls Bar (Visible only when an Android Emulator is selected) */}
+      {selectedDevice?.type === 'emulator' && (
+        <div className="w-full bg-slate-900 text-slate-100 p-3.5 rounded-custom border border-slate-800 space-y-2.5 text-xs select-none">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <span className="font-bold text-sky-400 text-[11px] uppercase tracking-wider flex items-center gap-1.5">
+              <MonitorPlay className="h-3.5 w-3.5" /> Emulator Controls ({selectedDevice?.name || 'AVD'})
+            </span>
+            <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold ${
+              selectedDevice?.status === 'running'
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+            }`}>
+              {selectedDevice?.status === 'running' ? 'Running' : 'OFF'}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {selectedDevice?.status === 'off' ? (
+              <button
+                onClick={() => startEmulator(selectedDevice?.avd_name)}
+                className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-md font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+              >
+                <Power className="h-3 w-3" /> Start
+              </button>
+            ) : (
+              <button
+                onClick={async () => {
+                  if (selectedDevice?.id) {
+                    await fetch('/api/emulator/stop', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ device_id: selectedDevice.id }),
+                    });
+                    await fetchDevicesList();
+                  }
+                }}
+                className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded-md font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+              >
+                <Power className="h-3 w-3" /> Stop
+              </button>
+            )}
+
+            <button
+              onClick={() => sendControlAction('rotate', { rotation: (rotationDegree + 1) % 4 })}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+            >
+              <RotateCw className="h-3 w-3" /> Rotate
+            </button>
+
+            <button
+              onClick={handleTakeScreenshot}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+            >
+              <Camera className="h-3 w-3 text-emerald-400" /> Screenshot
+            </button>
+
+            <button
+              onClick={() => fetch('/api/emulator/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'open_settings', device_id: selectedDevice?.id })
+              })}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+            >
+              <Settings className="h-3 w-3 text-indigo-400" /> Settings
+            </button>
+
+            <div className="flex items-center gap-1 ml-auto">
+              <span className="text-[10px] text-slate-400 font-bold">Resolution:</span>
+              <select
+                value={selectedResolution}
+                onChange={async (e) => {
+                  const val = e.target.value;
+                  setSelectedResolution(val);
+                  await fetch('/api/emulator/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'resolution', device_id: selectedDevice?.id, params: { resolution: val } })
+                  });
+                }}
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-md px-2 py-1 text-[10px] font-mono font-bold focus:outline-none focus:ring-1 focus:ring-sky-500 cursor-pointer"
+              >
+                <option value="1080x2400">1080×2400 (FHD+)</option>
+                <option value="1440x3120">1440×3120 (QHD+)</option>
+                <option value="720x1600">720×1600 (HD+)</option>
+                <option value="1800x2200">Tablet (1800×2200)</option>
+                <option value="2160x1916">Fold (2160×1916)</option>
+                <option value="2400x1080">Landscape (2400×1080)</option>
+              </select>
+            </div>
+          </div>
         </div>
       )}
 

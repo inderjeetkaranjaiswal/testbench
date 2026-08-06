@@ -3,12 +3,14 @@ import { Wifi, Activity, FlaskConical, Gauge, Check, RefreshCw } from 'lucide-re
 import { useProject } from '../context/ProjectContext.jsx';
 
 export default function TelemetryBar() {
-  const { activeProject, selectedTest } = useProject();
+  const { activeProject, selectedTest, selectedDevice } = useProject();
 
-  const [networkSpeed, setNetworkSpeed] = useState('Full');
+  const [networkSpeed, setNetworkSpeed] = useState('Unlimited');
   const [throttling, setThrottling] = useState(false);
   const [throttleMessage, setThrottleMessage] = useState(null);
   const [progress, setProgress] = useState(0);
+
+  const isRealDevice = selectedDevice?.type === 'real';
 
   // Reset progress bar whenever selectedTest changes
   useEffect(() => {
@@ -57,22 +59,6 @@ export default function TelemetryBar() {
     }
   };
 
-  const getSpeedBadgeColor = (speed) => {
-    switch (speed) {
-      case 'Full':
-      case '5G':
-        return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30';
-      case '4G':
-        return 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30';
-      case '3G':
-        return 'text-amber-400 bg-amber-500/10 border-amber-500/30';
-      case 'EDGE':
-        return 'text-rose-400 bg-rose-500/10 border-rose-500/30';
-      default:
-        return 'text-indigo-400 bg-indigo-500/10 border-indigo-500/30';
-    }
-  };
-
   return (
     <div className="w-full bg-slate-50 p-4 rounded-custom border border-custom-border space-y-3 mb-4 select-none">
       {/* Top Controls Row */}
@@ -80,23 +66,33 @@ export default function TelemetryBar() {
         {/* Network Speed Throttle Selector */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 font-bold text-text-primary">
-            <Gauge className="h-4 w-4 text-brand" /> Network Speed:
+            <Gauge className="h-4 w-4 text-brand" /> Network Profile:
           </div>
           <select
             id="network-speed-select"
             value={networkSpeed}
             onChange={handleSpeedChange}
-            disabled={throttling}
-            className="bg-white border border-custom-border text-text-primary rounded-custom px-3 py-1.5 text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-brand transition cursor-pointer"
+            disabled={throttling || isRealDevice}
+            title={isRealDevice ? 'Network profile simulation applies only to Android Emulators' : 'Select network profile'}
+            className="bg-white border border-custom-border text-text-primary rounded-custom px-3 py-1.5 text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-brand transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <option value="Full">Full (Unlimited)</option>
-            <option value="5G">5G (High Speed)</option>
-            <option value="4G">4G (LTE)</option>
+            <option value="Unlimited">Unlimited (Full)</option>
+            <option value="WiFi">WiFi</option>
+            <option value="2G">2G (GSM)</option>
             <option value="3G">3G (UMTS)</option>
-            <option value="EDGE">EDGE (2G)</option>
+            <option value="4G">4G (LTE)</option>
+            <option value="5G">5G (NR)</option>
+            <option value="Offline">Offline</option>
+            <option value="Custom">Custom Profile</option>
           </select>
 
-          {throttleMessage && (
+          {isRealDevice && (
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-600 border border-slate-300">
+              Disabled for Real Device
+            </span>
+          )}
+
+          {throttleMessage && !isRealDevice && (
             <span className="px-2 py-0.5 rounded text-[10px] font-bold border border-brand/30 bg-brand/10 text-brand transition">
               {throttleMessage}
             </span>

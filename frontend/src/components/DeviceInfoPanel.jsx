@@ -133,8 +133,8 @@ export default function DeviceInfoPanel() {
                 <p className="font-bold text-text-primary truncate">{dev.manufacturer || 'Unavailable'}</p>
               </div>
               <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
-                <span className="text-[10px] font-bold text-text-secondary uppercase">Model</span>
-                <p className="font-bold text-text-primary truncate">{dev.model || 'Unavailable'}</p>
+                <span className="text-[10px] font-bold text-text-secondary uppercase">Model / AVD Name</span>
+                <p className="font-bold text-text-primary truncate">{dev.avd_name || dev.model || 'Unavailable'}</p>
               </div>
               <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
                 <span className="text-[10px] font-bold text-text-secondary uppercase">Android Version</span>
@@ -143,6 +143,18 @@ export default function DeviceInfoPanel() {
               <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
                 <span className="text-[10px] font-bold text-text-secondary uppercase">SDK API</span>
                 <p className="font-bold text-text-primary font-mono truncate">{dev.sdk_version || 'Unavailable'}</p>
+              </div>
+              <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
+                <span className="text-[10px] font-bold text-text-secondary uppercase">RAM Memory</span>
+                <p className="font-mono text-[11px] font-bold text-indigo-600 truncate">{dev.ram || 'Unavailable'}</p>
+              </div>
+              <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
+                <span className="text-[10px] font-bold text-text-secondary uppercase">Internal Storage</span>
+                <p className="font-mono text-[11px] font-bold text-emerald-600 truncate">{dev.storage || 'Unavailable'}</p>
+              </div>
+              <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
+                <span className="text-[10px] font-bold text-text-secondary uppercase">Uptime</span>
+                <p className="font-mono text-[11px] text-text-primary truncate">{dev.uptime || 'Just now'}</p>
               </div>
               <div className="p-3 rounded-custom bg-slate-50 border border-custom-border space-y-1">
                 <span className="text-[10px] font-bold text-text-secondary uppercase">Build Number</span>

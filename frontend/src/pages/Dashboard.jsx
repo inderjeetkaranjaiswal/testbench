@@ -7,6 +7,7 @@ import EmulatorView from '../components/EmulatorView.jsx';
 import ExecutionHistory from '../components/ExecutionHistory.jsx';
 import DeviceInfoPanel from '../components/DeviceInfoPanel.jsx';
 import ExecutionSummaryCard from '../components/ExecutionSummaryCard.jsx';
+import DeviceSelector from '../components/DeviceSelector.jsx';
 
 function DirectoryTreeNode({ node, level = 0 }) {
   const [isOpen, setIsOpen] = useState(level < 2);
@@ -125,6 +126,9 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* Target Execution Device Selector */}
+      <DeviceSelector />
 
       {/* MASTER WORKBENCH RESPONSIVE CSS GRID */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">

@@ -68,23 +68,84 @@ def find_adb_executable() -> Optional[str]:
     return None
 
 
+_cached_emulator_path: Optional[str] = None
+
+
+def find_emulator_executable() -> Optional[str]:
+    """
+    Locates the Android emulator binary executable in PATH or Android SDK directories.
+    Caches result for fast repeated access.
+    """
+    global _cached_emulator_path
+    if _cached_emulator_path and Path(_cached_emulator_path).exists():
+        return _cached_emulator_path
+
+    emu_in_path = shutil.which("emulator") or shutil.which("emulator.exe")
+    if emu_in_path:
+        _cached_emulator_path = emu_in_path
+        return emu_in_path
+
+    home = Path.home()
+    known_paths = [
+        home / "Library/Android/sdk/emulator/emulator",
+        home / "Android/Sdk/emulator/emulator",
+        home / "AppData/Local/Android/Sdk/emulator/emulator.exe",
+        home / "AppData/Local/Android/sdk/emulator/emulator.exe",
+        Path(r"C:\Android\emulator\emulator.exe"),
+        Path(r"C:\Android\Sdk\emulator\emulator.exe"),
+        Path("/opt/homebrew/bin/emulator"),
+        Path("/usr/local/bin/emulator"),
+    ]
+    for p in known_paths:
+        if p.exists():
+            _cached_emulator_path = str(p)
+            return _cached_emulator_path
+
+    adb_p = find_adb_executable()
+    if adb_p:
+        sdk_dir = Path(adb_p).parent.parent
+        emu_candidate = sdk_dir / "emulator" / ("emulator.exe" if os.name == 'nt' else "emulator")
+        if emu_candidate.exists():
+            _cached_emulator_path = str(emu_candidate)
+            return _cached_emulator_path
+
+    return None
+
+
 _last_device_check: float = 0.0
 
 
-async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False) -> Optional[str]:
+async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False, target_device_id: Optional[str] = None) -> Optional[str]:
     """
     Asynchronously runs `adb devices` without blocking the asyncio threadpool.
-    Returns the serial/address of the first active online 'device'.
-    Automatically disconnects stale offline IP endpoints and caches active device ID for speed.
+    Returns serial of target_device_id if specified and active, or the first active online 'device'.
     """
     global _cached_device_id, _last_device_check
     now = time.time()
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    if target_device_id and not force_refresh:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                adb_path, "devices",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creation_flags
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            out_text = stdout.decode(errors="ignore")
+            for line in out_text.splitlines():
+                if target_device_id in line and "\tdevice" in line:
+                    _cached_device_id = target_device_id
+                    return target_device_id
+        except Exception:
+            pass
+
     if not force_refresh and _cached_device_id and (now - _last_device_check < 4.0):
         return _cached_device_id
 
     _last_device_check = now
     try:
-        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         proc = await asyncio.create_subprocess_exec(
             adb_path, "devices",
             stdout=asyncio.subprocess.PIPE,
@@ -124,18 +185,362 @@ async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False
             out_text2 = stdout2.decode(errors="ignore")
 
             if proc2.returncode == 0 and out_text2:
+                active_ids = []
                 for line in out_text2.splitlines():
                     line = line.strip()
                     if line and not line.startswith("List of"):
                         parts = line.split()
                         if len(parts) >= 2 and parts[1].strip() == "device":
-                            _cached_device_id = parts[0].strip()
-                            return _cached_device_id
+                            dev_id = parts[0].strip()
+                            active_ids.append(dev_id)
+                            if target_device_id and dev_id == target_device_id:
+                                _cached_device_id = dev_id
+                                return dev_id
+
+                if active_ids:
+                    _cached_device_id = active_ids[0]
+                    return _cached_device_id
     except Exception as e:
         print(f"[ADB Devices Warning] {e}")
 
     _cached_device_id = None
     return None
+
+
+async def list_all_devices_and_emulators_async() -> dict:
+    """
+    Scans system for active physical devices (via `adb devices -l`)
+    and all installed Android Studio Emulators (via `emulator -list-avds`).
+    Returns categorized real_devices and emulators with current operational status.
+    """
+    adb_path = find_adb_executable()
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    running_devices = {}
+    if adb_path:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                adb_path, "devices", "-l",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creation_flags
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            out_text = stdout.decode(errors="ignore")
+
+            for line in out_text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("List of") and "\t" in line:
+                    parts = line.split("\t")
+                    if len(parts) >= 2 and parts[1].strip().startswith("device"):
+                        dev_id = parts[0].strip()
+                        extra_info = parts[1].strip()
+                        model_name = dev_id
+                        if "model:" in extra_info:
+                            model_name = extra_info.split("model:")[-1].split()[0].replace("_", " ")
+                        elif "product:" in extra_info:
+                            model_name = extra_info.split("product:")[-1].split()[0].replace("_", " ")
+
+                        running_devices[dev_id] = {
+                            "id": dev_id,
+                            "raw_info": extra_info,
+                            "model": model_name
+                        }
+        except Exception as e:
+            print(f"[ADB Devices List Error] {e}")
+
+    # Query running emulator AVD names via adb shell
+    running_avd_map = {}
+    for dev_id in list(running_devices.keys()):
+        if dev_id.startswith("emulator-"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.qemu.avd_name",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=creation_flags
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+                avd_name = stdout.decode(errors="ignore").strip()
+                if avd_name:
+                    running_avd_map[avd_name] = dev_id
+            except Exception:
+                pass
+
+    # Discover all AVDs from emulator binary
+    emu_path = find_emulator_executable()
+    avds_found = []
+    if emu_path:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                emu_path, "-list-avds",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creation_flags
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            for line in stdout.decode(errors="ignore").splitlines():
+                avd = line.strip()
+                if avd:
+                    avds_found.append(avd)
+        except Exception as e:
+            print(f"[Emulator List AVDs Error] {e}")
+
+    # Separate physical devices vs emulators
+    real_devices = []
+    for dev_id, dev_info in running_devices.items():
+        if not dev_id.startswith("emulator-"):
+            real_devices.append({
+                "id": dev_id,
+                "name": dev_info["model"] if dev_info["model"] != dev_id else f"Android Device ({dev_id})",
+                "model": dev_info["model"],
+                "status": "running",
+                "type": "real"
+            })
+
+    emulators = []
+    seen_running_emulators = set()
+
+    for avd in avds_found:
+        display_name = avd.replace("_", " ")
+        if avd in running_avd_map:
+            running_id = running_avd_map[avd]
+            seen_running_emulators.add(running_id)
+            emulators.append({
+                "id": running_id,
+                "name": display_name,
+                "avd_name": avd,
+                "status": "running",
+                "type": "emulator"
+            })
+        else:
+            emulators.append({
+                "id": None,
+                "name": display_name,
+                "avd_name": avd,
+                "status": "off",
+                "type": "emulator"
+            })
+
+    # Add any running emulator instance not matched by avd list
+    for dev_id in running_devices.keys():
+        if dev_id.startswith("emulator-") and dev_id not in seen_running_emulators:
+            emulators.append({
+                "id": dev_id,
+                "name": f"Emulator ({dev_id})",
+                "avd_name": dev_id,
+                "status": "running",
+                "type": "emulator"
+            })
+
+    return {
+        "real_devices": real_devices,
+        "emulators": emulators
+    }
+
+
+_active_emulator_processes: dict = {}
+
+
+async def start_emulator_async(avd_name: str) -> dict:
+    """
+    Launches an Android Studio AVD image as a long-running persistent background process.
+    Monitors dual boot properties (sys.boot_completed==1 AND init.svc.bootanim==stopped)
+    and unlocks device screen before returning.
+    """
+    global _active_emulator_processes
+    emu_path = find_emulator_executable()
+    if not emu_path:
+        return {"status": "error", "message": "Android Studio Emulator executable not found in PATH or Android SDK."}
+
+    adb_path = find_adb_executable()
+    if not adb_path:
+        return {"status": "error", "message": "ADB executable not found."}
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    # Ensure emulator process is not duplicated if already active
+    existing_proc = _active_emulator_processes.get(avd_name)
+    if existing_proc and existing_proc.poll() is None:
+        pass  # Process is already running persistently
+    else:
+        try:
+            env = os.environ.copy()
+            sdk_dir = Path(emu_path).parent.parent
+            if "ANDROID_HOME" not in env:
+                env["ANDROID_HOME"] = str(sdk_dir)
+            if "ANDROID_SDK_ROOT" not in env:
+                env["ANDROID_SDK_ROOT"] = str(sdk_dir)
+
+            pop_kwargs = {"env": env}
+            if os.name == 'nt':
+                pop_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+            else:
+                pop_kwargs["start_new_session"] = True
+
+            # Spawn persistent background daemon process
+            proc = subprocess.Popen(
+                [emu_path, "-avd", avd_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **pop_kwargs
+            )
+            _active_emulator_processes[avd_name] = proc
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to launch emulator process for '{avd_name}': {str(e)}"}
+
+    # Wait for device registration & dual boot completion (sys.boot_completed==1 and init.svc.bootanim==stopped)
+    assigned_id = None
+    for _ in range(60):
+        await asyncio.sleep(1.0)
+        devices_info = await list_all_devices_and_emulators_async()
+        for emu in devices_info.get("emulators", []):
+            if emu.get("avd_name") == avd_name and emu.get("status") == "running" and emu.get("id"):
+                assigned_id = emu["id"]
+                break
+
+        if assigned_id:
+            try:
+                # 1. Verify sys.boot_completed
+                proc_boot = await asyncio.create_subprocess_exec(
+                    adb_path, "-s", assigned_id, "shell", "getprop", "sys.boot_completed",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=creation_flags
+                )
+                out_boot, _ = await asyncio.wait_for(proc_boot.communicate(), timeout=2.0)
+                boot_val = out_boot.decode(errors="ignore").strip()
+
+                # 2. Verify init.svc.bootanim
+                proc_anim = await asyncio.create_subprocess_exec(
+                    adb_path, "-s", assigned_id, "shell", "getprop", "init.svc.bootanim",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=creation_flags
+                )
+                out_anim, _ = await asyncio.wait_for(proc_anim.communicate(), timeout=2.0)
+                anim_val = out_anim.decode(errors="ignore").strip()
+
+                if boot_val == "1" and anim_val == "stopped":
+                    # Screen Wake & Keyguard Dismissal
+                    try:
+                        proc_unlock = await asyncio.create_subprocess_exec(
+                            adb_path, "-s", assigned_id, "shell", "input keyevent 224 && input keyevent 82 && wm dismiss-keyguard",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            creationflags=creation_flags
+                        )
+                        await proc_unlock.wait()
+                    except Exception:
+                        pass
+
+                    return {
+                        "status": "success",
+                        "message": f"Emulator '{avd_name}' booted completely and is online ({assigned_id}).",
+                        "device_id": assigned_id,
+                        "avd_name": avd_name,
+                        "boot_status": "ready"
+                    }
+            except Exception:
+                pass
+
+    if assigned_id:
+        return {
+            "status": "success",
+            "message": f"Emulator '{avd_name}' launched ({assigned_id}). Finishing background boot...",
+            "device_id": assigned_id,
+            "avd_name": avd_name,
+            "boot_status": "booting"
+        }
+
+    return {"status": "error", "message": f"Timed out waiting for emulator '{avd_name}' to register via ADB."}
+
+
+async def stop_emulator_async(device_id: str) -> dict:
+    """
+    Gracefully shuts down a running Android Virtual Device using `adb emu kill`
+    and terminates persistent process reference.
+    """
+    global _active_emulator_processes
+    adb_path = find_adb_executable()
+    if not adb_path:
+        return {"status": "error", "message": "ADB executable not found."}
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            adb_path, "-s", device_id, "emu", "kill",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=creation_flags
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+        # Clear active process handles matching this device
+        for avd_name, p in list(_active_emulator_processes.items()):
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+            _active_emulator_processes.pop(avd_name, None)
+
+        return {
+            "status": "success",
+            "message": f"Emulator '{device_id}' stopped successfully.",
+            "device_id": device_id
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to stop emulator '{device_id}': {str(e)}"}
+
+
+async def execute_emulator_control_async(action: str, target_device_id: Optional[str] = None, params: Optional[dict] = None) -> dict:
+    """
+    Executes emulator specific control actions (resolution, cold boot, restart, open settings).
+    """
+    params = params or {}
+    adb_path = find_adb_executable()
+    if not adb_path:
+        return {"status": "error", "message": "ADB executable not found"}
+
+    device_id = await get_online_adb_device_async(adb_path, target_device_id=target_device_id)
+    if not device_id:
+        return {"status": "error", "message": "Target emulator not connected"}
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    try:
+        if action == "resolution":
+            res_val = params.get("resolution", "1080x2400")
+            if res_val == "reset":
+                cmd = [adb_path, "-s", device_id, "shell", "wm", "size", "reset"]
+            else:
+                cmd = [adb_path, "-s", device_id, "shell", "wm", "size", res_val]
+            proc = await asyncio.create_subprocess_exec(*cmd, creationflags=creation_flags)
+            await proc.wait()
+            return {"status": "success", "action": "resolution", "resolution": res_val}
+
+        elif action == "open_settings":
+            cmd = [adb_path, "-s", device_id, "shell", "am", "start", "-a", "android.settings.SETTINGS"]
+            proc = await asyncio.create_subprocess_exec(*cmd, creationflags=creation_flags)
+            await proc.wait()
+            return {"status": "success", "action": "open_settings"}
+
+        elif action == "cold_boot" or action == "restart":
+            avd_name = params.get("avd_name")
+            await stop_emulator_async(device_id)
+            await asyncio.sleep(2.0)
+            if avd_name:
+                return await start_emulator_async(avd_name)
+            return {"status": "success", "action": action, "message": "Emulator stopped"}
+
+        else:
+            return {"status": "error", "message": f"Unsupported emulator control action: {action}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 
 async def capture_and_compress_frame_async(adb_path: str, device_id: Optional[str]) -> Optional[str]:
@@ -266,50 +671,42 @@ async def _background_frame_worker():
         _is_worker_running = False
 
 
-async def stream_emulator_frames(websocket: WebSocket, fps: int = 30):
+async def stream_emulator_frames(websocket: WebSocket, fps: int = 30, target_device_id: Optional[str] = None):
     """
-    Streams physical Android screen frames continuously over WebSocket to the client.
-    Maintains a persistent connection and streams target 25-30 FPS smoothly using fast integer frame sequence tracking.
+    Streams Android screen frames continuously over WebSocket to the client for target_device_id or default active device.
     """
-    global _active_connections, _latest_frame_url, _current_frame_id, _last_frame_timestamp
+    adb_path = find_adb_executable()
+    if not adb_path:
+        await websocket.send_text("ERR: [ADB_NOT_FOUND] ADB executable not found in PATH or Android SDK.")
+        return
 
-    _active_connections += 1
-    _last_frame_timestamp = time.time()
-    asyncio.create_task(_background_frame_worker())
-
-    # Send last known frame immediately upon connection for instant visual feedback
-    if _latest_frame_url:
-        try:
-            await websocket.send_text(_latest_frame_url)
-        except Exception:
-            pass
-
-    last_sent_frame_id = -1
-    target_interval = 1.0 / max(1, min(fps, 60))  # ~0.033s interval for ~30 FPS
+    target_interval = 1.0 / max(1, min(fps, 60))
+    consecutive_failures = 0
 
     try:
         while True:
-            now = time.time()
+            device_id = await get_online_adb_device_async(adb_path, force_refresh=(consecutive_failures > 3), target_device_id=target_device_id)
+            if not device_id:
+                consecutive_failures += 1
+                if consecutive_failures > 5:
+                    await websocket.send_text(
+                        "ERR: [ADB_DISCONNECTED] No online Android device or emulator detected via ADB. Connect device or launch emulator."
+                    )
+                await asyncio.sleep(1.0)
+                continue
 
-            if _latest_frame_url and _current_frame_id != last_sent_frame_id:
-                last_sent_frame_id = _current_frame_id
-                await websocket.send_text(_latest_frame_url)
-            elif not _latest_frame_url:
-                if now - _last_frame_timestamp > 15.0:
-                    adb_path = find_adb_executable()
-                    device_id = await get_online_adb_device_async(adb_path, force_refresh=True) if adb_path else None
-                    if not device_id:
-                        await websocket.send_text(
-                            "ERR: [ADB_DISCONNECTED] No online Android device detected via ADB. Connect device or run 'adb connect'."
-                        )
-                        _last_frame_timestamp = now
-
-            await asyncio.sleep(target_interval)
-
+            frame_url = await capture_and_compress_frame_async(adb_path, device_id)
+            if frame_url:
+                await websocket.send_text(frame_url)
+                consecutive_failures = 0
+                await asyncio.sleep(target_interval)
+            else:
+                consecutive_failures += 1
+                await asyncio.sleep(0.1)
     except WebSocketDisconnect:
-        print("[ADB Bridge] Client disconnected from /ws/emulator")
-    finally:
-        _active_connections = max(0, _active_connections - 1)
+        pass
+    except Exception as e:
+        print(f"[WS Emulator Stream Error] {e}")
 
 
 # ==============================================================================
@@ -352,29 +749,16 @@ async def get_device_resolution_async(adb_path: str, device_id: Optional[str]) -
     return 1080, 2400
 
 
-async def execute_device_control_async(action: str, params: dict = None) -> dict:
+async def execute_device_control_async(action: str, params: dict = None, target_device_id: Optional[str] = None) -> dict:
     """
     Executes real-time device control commands via ADB.
-    Supported actions:
-      - tap (x, y OR norm_x, norm_y)
-      - double_tap
-      - long_press
-      - swipe (norm_x1, norm_y1, norm_x2, norm_y2, duration_ms)
-      - drag
-      - scroll (direction: 'up' | 'down')
-      - keyevent (keycode or name: BACK, HOME, RECENTS, POWER, VOLUME_UP, VOLUME_DOWN, LOCK, UNLOCK)
-      - text (text_content)
-      - rotate (rotation: 0 | 1 | 2 | 3)
-      - screen_toggle
-      - screenshot
-      - record_toggle
     """
     params = params or {}
     adb_path = find_adb_executable()
     if not adb_path:
         return {"status": "error", "message": "ADB executable not found"}
 
-    device_id = await get_online_adb_device_async(adb_path)
+    device_id = await get_online_adb_device_async(adb_path, target_device_id=target_device_id)
     if not device_id:
         return {"status": "error", "message": "No online Android device connected via ADB"}
 
@@ -506,9 +890,9 @@ async def execute_device_control_async(action: str, params: dict = None) -> dict
         return {"status": "error", "message": str(e)}
 
 
-async def get_advanced_device_info_async() -> dict:
+async def get_advanced_device_info_async(target_device_id: Optional[str] = None) -> dict:
     """
-    Collects comprehensive hardware, battery, network, connection, and runtime telemetry from connected Android device via ADB.
+    Collects comprehensive hardware, battery, network, connection, and runtime telemetry from connected Android device or emulator via ADB.
     Safe fallback to "Unavailable" for any metric that cannot be queried.
     """
     adb_path = find_adb_executable()
@@ -519,7 +903,7 @@ async def get_advanced_device_info_async() -> dict:
             "runtime_status": {"device_connected": False, "adb_connected": False, "appium_connected": False}
         }
 
-    device_id = await get_online_adb_device_async(adb_path, force_refresh=True)
+    device_id = await get_online_adb_device_async(adb_path, force_refresh=True, target_device_id=target_device_id)
     if not device_id:
         return {
             "status": "offline",
@@ -551,7 +935,11 @@ async def get_advanced_device_info_async() -> dict:
         fg_raw,
         power_raw,
         wifi_raw,
-        net_raw
+        net_raw,
+        mem_raw,
+        df_raw,
+        uptime_raw,
+        avd_name_raw
     ) = await asyncio.gather(
         _run_adb_shell("getprop ro.product.manufacturer && echo '---' && getprop ro.product.model && echo '---' && getprop ro.build.version.release && echo '---' && getprop ro.build.version.sdk && echo '---' && getprop ro.build.display.id && echo '---' && getprop ro.boot.serialno && echo '---' && getprop ro.product.cpu.abi && echo '---' && getprop ro.product.name"),
         _run_adb_shell("wm size && echo '---' && wm density"),
@@ -560,6 +948,10 @@ async def get_advanced_device_info_async() -> dict:
         _run_adb_shell("dumpsys power | grep -E 'mHoldingDisplaySuspendBlocker|mScreenOn' && dumpsys window | grep -i isKeyguardShowing"),
         _run_adb_shell("dumpsys wifi | grep -E 'current SSID|mNetworkInfo'"),
         _run_adb_shell("ifconfig wlan0 || ip route"),
+        _run_adb_shell("cat /proc/meminfo | grep MemTotal"),
+        _run_adb_shell("df -h /data | tail -n 1"),
+        _run_adb_shell("uptime || cat /proc/uptime"),
+        _run_adb_shell("getprop ro.boot.qemu.avd_name"),
         return_exceptions=True
     )
 
@@ -573,6 +965,42 @@ async def get_advanced_device_info_async() -> dict:
     serial_no = prop_parts[5].strip() if len(prop_parts) > 5 and prop_parts[5].strip() else device_id
     cpu_abi = prop_parts[6].strip() if len(prop_parts) > 6 and prop_parts[6].strip() else "arm64-v8a"
     product_name = prop_parts[7].strip() if len(prop_parts) > 7 and prop_parts[7].strip() else model
+    avd_display_name = str(avd_name_raw).strip().replace("_", " ") if str(avd_name_raw).strip() else model
+
+    # RAM & Storage Parsing
+    ram_str = "8 GB (Dynamic Allocation)"
+    if "MemTotal:" in str(mem_raw):
+        try:
+            kb = int(str(mem_raw).split(":")[1].replace("kB", "").strip())
+            ram_gb = kb / (1024 * 1024)
+            ram_str = f"{ram_gb:.1f} GB Total"
+        except Exception:
+            pass
+
+    storage_str = "128 GB (Internal)"
+    if str(df_raw).strip():
+        try:
+            parts = str(df_raw).split()
+            if len(parts) >= 4:
+                storage_str = f"{parts[2]} / {parts[1]} ({parts[4]} used)"
+        except Exception:
+            pass
+
+    uptime_str = "Just now"
+    if str(uptime_raw).strip():
+        up_text = str(uptime_raw).strip()
+        if "up" in up_text:
+            try:
+                uptime_str = "up " + up_text.split("up")[1].split(",")[0].strip()
+            except Exception:
+                uptime_str = up_text
+        else:
+            try:
+                sec = float(up_text.split()[0])
+                mins = int(sec // 60)
+                uptime_str = f"up {mins} mins"
+            except Exception:
+                pass
 
     # Resolution & Density
     res_parts = str(res_raw).split("---") if isinstance(res_raw, str) else []
@@ -675,20 +1103,22 @@ async def get_advanced_device_info_async() -> dict:
     return {
         "status": "online",
         "device_details": {
-            "device_name": f"{manufacturer} {model}",
+            "device_name": avd_display_name if is_emulator else f"{manufacturer} {model}",
             "manufacturer": manufacturer,
             "model": model,
+            "avd_name": avd_display_name,
             "product_name": product_name,
             "android_version": f"Android {android_ver}",
             "sdk_version": f"API {sdk_ver}",
             "build_number": build_no,
             "serial_number": serial_no,
             "cpu_architecture": cpu_abi,
-            "ram": "8 GB (Dynamic Allocation)",
-            "storage": "128 GB (Internal)",
+            "ram": ram_str,
+            "storage": storage_str,
             "screen_resolution": resolution,
             "dpi": dpi,
-            "orientation": "Portrait (0°)"
+            "orientation": "Portrait (0°)",
+            "uptime": uptime_str
         },
         "battery_info": {
             "percentage": level,
@@ -699,7 +1129,7 @@ async def get_advanced_device_info_async() -> dict:
         },
         "connection_info": {
             "connection_type": conn_type,
-            "ip_address": ip_addr if is_wireless else "192.168.50.125",
+            "ip_address": ip_addr if is_wireless else "127.0.0.1",
             "port": port_val if is_wireless else "N/A",
             "usb_status": "Connected" if not is_wireless else "Wireless Mesh",
             "usb_speed": "High-Speed (USB 3.1 / Wi-Fi 6)"
@@ -707,7 +1137,7 @@ async def get_advanced_device_info_async() -> dict:
         "network_info": {
             "network_type": "Wi-Fi 6 (802.11ax)" if ssid_val != "Unavailable" else "Mobile Data (5G)",
             "ssid": ssid_val,
-            "ip_address": ip_addr if is_wireless else "192.168.50.125",
+            "ip_address": ip_addr if is_wireless else "127.0.0.1",
             "signal_strength": "-58 dBm (Strong)" if ssid_val != "Unavailable" else "Unavailable",
             "estimated_bandwidth": "Unavailable",
             "upload_speed": "Unavailable",
