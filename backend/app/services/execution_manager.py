@@ -291,7 +291,7 @@ class ExecutionManager:
 
                     try:
                         from app.services.runner import update_session_status
-                        update_session_status(job_id, job.status, exit_code=job.exit_code, error_message=job.error)
+                        update_session_status(job_id, job.status, exit_code=job.exit_code, error_message=job.error, duration=job.duration)
                     except Exception:
                         pass
 

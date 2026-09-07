@@ -43,6 +43,7 @@ class ExecutionSession:
     status: str  # IDLE, RUNNING, COMPLETED, FAILED
     progress: int  # 0 to 100
     start_time: float
+    duration: float = 0.0
     appium_port: int = 4723
     last_action: str = ""
     error_message: str = ""
@@ -65,13 +66,19 @@ def update_session_status(
     execution_id: str,
     status: str,
     exit_code: Optional[int] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    duration: Optional[float] = None
 ):
     """Explicitly updates an execution session status in memory."""
     global _active_sessions
     if execution_id in _active_sessions:
         s = _active_sessions[execution_id]
         s.status = status
+        if duration is not None:
+            s.duration = duration
+        elif s.start_time > 0 and s.duration == 0.0:
+            s.duration = round(time.time() - s.start_time, 2)
+
         if status == "COMPLETED":
             s.progress = 100
             s.last_action = "Execution Completed Successfully"
@@ -105,16 +112,18 @@ def get_active_session(execution_id: Optional[str] = None, device_id: Optional[s
 
     if target_session:
         # Cross-validate with DB so that in-memory session never stays stuck in RUNNING if job completed/failed/cancelled
-        if target_session.status == "RUNNING":
-            try:
-                from app.services.db import get_execution_job
-                db_job = get_execution_job(target_session.execution_id)
-                if db_job and db_job.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+        try:
+            from app.services.db import get_execution_job
+            db_job = get_execution_job(target_session.execution_id)
+            if db_job:
+                if target_session.status == "RUNNING" and db_job.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
                     target_session.status = db_job["status"]
                     if db_job.get("error"):
                         target_session.error_message = db_job["error"]
-            except Exception:
-                pass
+                if target_session.duration == 0.0 and db_job.get("duration"):
+                    target_session.duration = float(db_job["duration"])
+        except Exception:
+            pass
         return target_session.to_dict()
 
     return {
@@ -127,6 +136,7 @@ def get_active_session(execution_id: Optional[str] = None, device_id: Optional[s
         "status": "IDLE",
         "progress": 0,
         "start_time": 0,
+        "duration": 0.0,
         "appium_port": 4723,
         "last_action": "",
         "error_message": ""
@@ -1078,6 +1088,9 @@ def execute_job_sync(
                 session.status = "FAILED"
                 session.last_action = f"Execution Failed (Exit Code {exit_code})"
                 session.error_message = error_msg or f"Process exited with code {exit_code}"
+
+            if session.start_time > 0:
+                session.duration = round(time.time() - session.start_time, 2)
 
             f.write("\n==================================================\n")
             f.write(f"[RUNNER FINISHED] Process exited with code {exit_code}\n")

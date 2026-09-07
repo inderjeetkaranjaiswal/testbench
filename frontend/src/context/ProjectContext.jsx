@@ -144,26 +144,37 @@ export function ProjectProvider({ children }) {
       const res = await fetch(`/api/execution/session${devQuery}`);
       if (res.ok) {
         const data = await res.json();
-        if (data && data.execution_id) {
+        if (data && data.execution_id && data.status !== 'IDLE') {
           setExecutionSession(data);
           const isRunningStatus = data.status === 'RUNNING' || data.status === 'STARTING' || data.status === 'QUEUED';
           setIsExecuting(isRunningStatus);
 
-          if (isRunningStatus && data.start_time) {
+          const startMs = data.start_time ? data.start_time * 1000 : null;
+
+          if (isRunningStatus && startMs) {
             if (!executionStartTimeRef.current) {
-              executionStartTimeRef.current = data.start_time * 1000;
+              executionStartTimeRef.current = startMs;
             }
             setExecutionStats((prev) => ({
               ...prev,
-              startTime: prev.startTime || (data.start_time * 1000),
+              startTime: startMs,
+              endTime: null,
             }));
-          } else if (!isRunningStatus && data.status && data.status !== 'IDLE') {
+          } else if (!isRunningStatus) {
+            const durationSec = typeof data.duration === 'number' && data.duration > 0
+              ? Math.round(data.duration)
+              : 0;
+
             setExecutionStats((prev) => ({
               ...prev,
-              endTime: prev.endTime || Date.now(),
-              totalExecutionTime: data.start_time ? Math.round((Date.now() - (data.start_time * 1000)) / 1000) : prev.totalExecutionTime,
+              startTime: startMs || prev.startTime,
+              endTime: startMs && durationSec ? (startMs + durationSec * 1000) : prev.endTime,
+              totalExecutionTime: durationSec > 0 ? durationSec : (prev.totalExecutionTime || 0),
             }));
           }
+        } else if (data && data.status === 'IDLE') {
+          setIsExecuting(false);
+          executionStartTimeRef.current = null;
         }
       }
 
