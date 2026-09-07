@@ -716,6 +716,8 @@ def resolve_test_args(
                         class_names.append(class_name)
             if class_names:
                 args.append(f"-Dtest={','.join(class_names)}")
+                # Override static suiteXmlFiles in pom.xml so Surefire executes the targeted test
+                args.append("-Dsurefire.suiteXmlFiles=")
 
         if target_udid:
             args.append(f"-DdeviceUdid={target_udid}")
@@ -746,6 +748,27 @@ def resolve_test_args(
             clean_test_file = test_file.replace("\\", "/")
             args.extend(["--", clean_test_file])
         return npm_bin, args, env_vars, "javascript"
+
+
+def sync_compiled_classes_to_test_classes(project_root: Path):
+    """
+    For Maven projects with custom sourceDirectory (tests placed in sourceDirectory),
+    ensures compiled test classes in target/classes are mirrored to target/test-classes
+    so Maven Surefire can discover and execute them.
+    """
+    try:
+        classes_dir = project_root / "target" / "classes"
+        test_classes_dir = project_root / "target" / "test-classes"
+        if classes_dir.exists():
+            test_classes_dir.mkdir(parents=True, exist_ok=True)
+            for item in classes_dir.iterdir():
+                dest = test_classes_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest, dirs_exist_ok=True)
+                elif item.is_file() and not dest.exists():
+                    shutil.copy2(item, dest)
+    except Exception as e:
+        print(f"[RUNNER SYNC CLASSES WARNING] {e}")
 
 
 def resolve_test_command(project_path: str, test_file: Optional[str] = None) -> str:
@@ -844,6 +867,9 @@ def run_test_background(
                 if not apk_success:
                     f.write("\n[RUNNER WARNING] APK install warning recorded.\n")
                     f.flush()
+
+            if framework == "maven":
+                sync_compiled_classes_to_test_classes(project_root)
 
             creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
@@ -1140,6 +1166,8 @@ async def run_test_process_websocket(
 
     watcher = ExcelReportWatcher(str(project_root), project_name, loop, on_report_generated)
     watcher.start()
+    if framework == "maven":
+        sync_compiled_classes_to_test_classes(project_root)
 
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     process = None
