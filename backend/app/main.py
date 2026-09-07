@@ -63,6 +63,22 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup_event():
     log_startup_diagnostics()
+    execution_manager.start_worker()
+
+    # Wire DeviceManager change events to WebSocket broadcast
+    import json
+    async def on_device_change(event_type: str, device_dict: dict, all_devices: list):
+        msg = json.dumps({
+            "event": event_type,
+            "device": device_dict,
+            "devices": all_devices,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        })
+        await manager.broadcast(msg)
+
+    device_manager.add_device_change_callback(on_device_change)
+    await device_manager.start_device_monitor_loop(poll_interval=1.0)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -604,9 +620,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@app.on_event("startup")
-async def startup_event():
-    execution_manager.start_worker()
 
 
 class CreateExecutionRequest(BaseModel):
@@ -799,6 +812,7 @@ async def get_recording_file_endpoint(filename: str, download: bool = False):
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanly stops all active device capture pipelines on server shutdown."""
+    device_manager.stop_device_monitor_loop()
     from app.services.capture_pipeline import capture_pipeline_manager
     await capture_pipeline_manager.stop_all()
 

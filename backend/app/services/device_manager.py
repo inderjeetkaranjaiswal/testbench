@@ -56,6 +56,81 @@ class DeviceManager:
         self._device_locks: Dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
         self._cached_devices: Dict[str, UnifiedDevice] = {}
+        self._device_change_callbacks: List[Any] = []
+        self._last_connected_serials: Set[str] = set()
+        self._monitor_task: Optional[asyncio.Task] = None
+
+    def add_device_change_callback(self, callback):
+        """Registers a callback func(event_type: str, device_dict: dict, all_devices: list)"""
+        if callback not in self._device_change_callbacks:
+            self._device_change_callbacks.append(callback)
+
+    def remove_device_change_callback(self, callback):
+        if callback in self._device_change_callbacks:
+            self._device_change_callbacks.remove(callback)
+
+    async def _notify_device_change(self, event_type: str, device_dict: dict, all_devices: list):
+        for cb in self._device_change_callbacks:
+            try:
+                res = cb(event_type, device_dict, all_devices)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                print(f"[DeviceManager Callback Error] {e}")
+
+    async def start_device_monitor_loop(self, poll_interval: float = 1.0):
+        """Runs a continuous high-frequency poll loop to instantly detect device connects/disconnects."""
+        if self._monitor_task and not self._monitor_task.done():
+            return
+
+        async def _loop():
+            # Initial baseline scan
+            try:
+                initial_devs = await self.discover_all_devices_async()
+                self._last_connected_serials = {d.id for d in initial_devs if d.id}
+            except Exception:
+                self._last_connected_serials = set()
+
+            while True:
+                try:
+                    await asyncio.sleep(poll_interval)
+                    devices = await self.discover_all_devices_async()
+                    current_online = {d.id: d for d in devices if d.id}
+                    current_serials = set(current_online.keys())
+
+                    new_connected = current_serials - self._last_connected_serials
+                    disconnected = self._last_connected_serials - current_serials
+
+                    all_dicts = [d.to_dict() for d in devices]
+
+                    for dev_id in new_connected:
+                        dev = current_online[dev_id]
+                        # Fetch full specs for the newly connected device instantly
+                        try:
+                            telemetry = await get_advanced_device_info_async(dev_id)
+                        except Exception:
+                            telemetry = {}
+                        
+                        dev_payload = dev.to_dict()
+                        dev_payload["specs"] = telemetry
+                        await self._notify_device_change("device_connected", dev_payload, all_dicts)
+
+                    for dev_id in disconnected:
+                        await self._notify_device_change("device_disconnected", {"id": dev_id}, all_dicts)
+
+                    self._last_connected_serials = current_serials
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    # Keep monitor loop alive
+                    await asyncio.sleep(1.0)
+
+        self._monitor_task = asyncio.create_task(_loop())
+
+    def stop_device_monitor_loop(self):
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+
 
     async def get_or_create_device_lock(self, device_id: str) -> asyncio.Lock:
         async with self._locks_guard:

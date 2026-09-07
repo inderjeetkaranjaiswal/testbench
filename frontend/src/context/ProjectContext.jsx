@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import { CheckCircle2, AlertCircle, Info, AlertTriangle, X } from 'lucide-react';
 import ShortcutsModal from '../components/ShortcutsModal.jsx';
+import DeviceConnectedModal from '../components/DeviceConnectedModal.jsx';
 
 const ProjectContext = createContext(null);
 
@@ -132,6 +133,7 @@ export function ProjectProvider({ children }) {
   const [selectedDevice, setSelectedDevice] = useState(null);
   const [loadingDevices, setLoadingDevices] = useState(false);
   const [startingEmulator, setStartingEmulator] = useState(null);
+  const [connectedModalDevice, setConnectedModalDevice] = useState(null);
   // Multi-session tracking
   const [activeSessions, setActiveSessions] = useState([]);
 
@@ -241,6 +243,87 @@ export function ProjectProvider({ children }) {
     }
   };
 
+  // Live WebSocket Connection for Instant Device Connect/Disconnect Detection
+  useEffect(() => {
+    let ws = null;
+    let reconnectTimeout = null;
+
+    const connectWs = () => {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/logs`;
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          console.log('[WebSocket] Device monitor connected.');
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data && data.event === 'device_connected') {
+              const dev = data.device;
+              const isWifi = dev.connection === 'wifi' || dev.id?.includes(':');
+              const devName = dev.name || dev.model || dev.id;
+              
+              // 1. Immediately trigger the Device Connected popup modal with specs
+              setConnectedModalDevice(dev);
+              
+              // 2. Auto-select this newly connected phone as target device
+              setSelectedDevice(dev);
+
+              // 3. Show high-priority Toast
+              showToast(
+                `Device Connected: ${devName} (${isWifi ? 'Wi-Fi' : 'USB'})`,
+                'success',
+                6000
+              );
+
+              // 4. Add to notification center
+              addNotification(
+                'Device Connected',
+                `${devName} was detected and configured as target execution device (${isWifi ? 'Wireless ADB' : 'USB'}).`,
+                'success'
+              );
+
+              // 5. Instantly refresh device list and full specs
+              fetchDevicesList();
+              fetchDeviceInfo();
+            } else if (data && data.event === 'device_disconnected') {
+              const devId = data.device?.id;
+              showToast(`Device Disconnected (${devId})`, 'warning', 4000);
+              addNotification(
+                'Device Disconnected',
+                `Android device ${devId} was disconnected.`,
+                'warning'
+              );
+              fetchDevicesList();
+            }
+          } catch (e) {
+            // Not a JSON device event, ignore
+          }
+        };
+
+        ws.onclose = () => {
+          reconnectTimeout = setTimeout(connectWs, 3000);
+        };
+
+        ws.onerror = () => {
+          ws?.close();
+        };
+      } catch (err) {
+        reconnectTimeout = setTimeout(connectWs, 3000);
+      }
+    };
+
+    connectWs();
+
+    return () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (ws) ws.close();
+    };
+  }, []);
+
   useEffect(() => {
     fetchDevicesList();
     fetchDeviceInfo();
@@ -249,7 +332,7 @@ export function ProjectProvider({ children }) {
       fetchDevicesList();
       fetchDeviceInfo();
       fetchExecutionSession();
-    }, 2000);
+    }, 1500);
     return () => clearInterval(interval);
   }, [selectedDevice?.id]);
 
@@ -559,6 +642,8 @@ export function ProjectProvider({ children }) {
         markAllNotificationsRead,
         clearNotifications,
         unreadNotificationsCount,
+        connectedModalDevice,
+        setConnectedModalDevice,
         showShortcutsModal,
         setShowShortcutsModal,
         requestDesktopNotificationPermission,
@@ -568,6 +653,9 @@ export function ProjectProvider({ children }) {
 
       {/* Keyboard Shortcuts Cheat Sheet Modal */}
       <ShortcutsModal />
+
+      {/* Instant Device Connected Specs Popup Modal */}
+      <DeviceConnectedModal />
 
       {/* Floating Toast Notification Container */}
       <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2.5 max-w-sm w-full pointer-events-none">
