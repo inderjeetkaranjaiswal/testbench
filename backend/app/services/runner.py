@@ -61,23 +61,62 @@ _allocated_appium_ports: set = set()
 _appium_processes: Dict[str, subprocess.Popen] = {}
 
 
+def update_session_status(
+    execution_id: str,
+    status: str,
+    exit_code: Optional[int] = None,
+    error_message: Optional[str] = None
+):
+    """Explicitly updates an execution session status in memory."""
+    global _active_sessions
+    if execution_id in _active_sessions:
+        s = _active_sessions[execution_id]
+        s.status = status
+        if status == "COMPLETED":
+            s.progress = 100
+            s.last_action = "Execution Completed Successfully"
+        elif status == "FAILED":
+            s.last_action = f"Execution Failed (Exit Code {exit_code})" if exit_code is not None else "Execution Failed"
+            if error_message:
+                s.error_message = error_message
+        elif status == "CANCELLED":
+            s.last_action = "Execution Cancelled by User"
+
+
 def get_active_session(execution_id: Optional[str] = None, device_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Returns the execution session state for execution_id, device_id, or the latest active session.
-    Maintains backward compatibility with singular /api/execution/session endpoint.
+    Cross-validates with DB and worker state so stale 'RUNNING' statuses never linger after completion.
     """
     global _active_sessions, _latest_session_id
+    target_session = None
+
     if execution_id and execution_id in _active_sessions:
-        return _active_sessions[execution_id].to_dict()
-    if device_id:
+        target_session = _active_sessions[execution_id]
+    elif device_id:
         for s in reversed(list(_active_sessions.values())):
             if s.device_id == device_id:
-                return s.to_dict()
-    if _latest_session_id and _latest_session_id in _active_sessions:
-        return _active_sessions[_latest_session_id].to_dict()
-    if _active_sessions:
-        latest = list(_active_sessions.values())[-1]
-        return latest.to_dict()
+                target_session = s
+                break
+    elif _latest_session_id and _latest_session_id in _active_sessions:
+        target_session = _active_sessions[_latest_session_id]
+    elif _active_sessions:
+        target_session = list(_active_sessions.values())[-1]
+
+    if target_session:
+        # Cross-validate with DB so that in-memory session never stays stuck in RUNNING if job completed/failed/cancelled
+        if target_session.status == "RUNNING":
+            try:
+                from app.services.db import get_execution_job
+                db_job = get_execution_job(target_session.execution_id)
+                if db_job and db_job.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+                    target_session.status = db_job["status"]
+                    if db_job.get("error"):
+                        target_session.error_message = db_job["error"]
+            except Exception:
+                pass
+        return target_session.to_dict()
+
     return {
         "execution_id": "",
         "project_id": "",
@@ -1028,6 +1067,18 @@ def execute_job_sync(
 
             exit_code = proc.wait()
 
+            if check_cancel_callback and check_cancel_callback():
+                session.status = "CANCELLED"
+                session.last_action = "Execution Cancelled by User"
+            elif exit_code == 0:
+                session.status = "COMPLETED"
+                session.progress = 100
+                session.last_action = "Execution Completed Successfully"
+            else:
+                session.status = "FAILED"
+                session.last_action = f"Execution Failed (Exit Code {exit_code})"
+                session.error_message = error_msg or f"Process exited with code {exit_code}"
+
             f.write("\n==================================================\n")
             f.write(f"[RUNNER FINISHED] Process exited with code {exit_code}\n")
             f.write("==================================================\n")
@@ -1039,12 +1090,22 @@ def execute_job_sync(
                 report_path = str(latest_excel)
 
         except Exception as e:
+            session.status = "FAILED"
+            session.last_action = "Execution Exception Occurred"
+            session.error_message = str(e)
             f.write(f"\n[RUNNER EXCEPTION] Execution error: {e}\n")
             f.flush()
             error_msg = str(e)
             exit_code = -1
 
         finally:
+            if session.status == "RUNNING":
+                if check_cancel_callback and check_cancel_callback():
+                    session.status = "CANCELLED"
+                elif exit_code == 0:
+                    session.status = "COMPLETED"
+                else:
+                    session.status = "FAILED"
             stop_dedicated_appium_server(execution_id, appium_port, system_port)
             device_manager.release_device_sync(target_udid, execution_id)
             _device_reservations.pop(target_udid, None)

@@ -187,7 +187,7 @@ def get_latest_execution_status(project_name: str) -> Dict[str, Any]:
             j = dict(job_row)
             # Map standardized job statuses to UI status string
             st_map = {
-                "QUEUED": "Queued",
+                "QUEUED": "Running",
                 "STARTING": "Running",
                 "RUNNING": "Running",
                 "COMPLETED": "Completed",

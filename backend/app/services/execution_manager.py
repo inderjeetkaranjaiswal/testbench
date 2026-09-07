@@ -140,6 +140,11 @@ class ExecutionManager:
                 completed_at=now_iso,
                 error=job.error
             )
+            try:
+                from app.services.runner import update_session_status
+                update_session_status(job_id, "CANCELLED", error_message=job.error)
+            except Exception:
+                pass
             return job
 
         if job.status in ("STARTING", "RUNNING"):
@@ -284,6 +289,12 @@ class ExecutionManager:
                         error=job.error
                     )
 
+                    try:
+                        from app.services.runner import update_session_status
+                        update_session_status(job_id, job.status, exit_code=job.exit_code, error_message=job.error)
+                    except Exception:
+                        pass
+
                 except Exception as e:
                     now_end = datetime.datetime.now(datetime.timezone.utc)
                     job.completed_at = now_end.isoformat()
@@ -299,6 +310,11 @@ class ExecutionManager:
                         result="failed",
                         error=str(e)
                     )
+                    try:
+                        from app.services.runner import update_session_status
+                        update_session_status(job_id, "FAILED", error_message=str(e))
+                    except Exception:
+                        pass
                 finally:
                     self._active_job_id = None
                     self._active_proc = None

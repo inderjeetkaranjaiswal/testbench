@@ -111,6 +111,7 @@ export function ProjectProvider({ children }) {
   const [operatingMode, setOperatingMode] = useState('view'); // 'view' | 'interactive'
   const [isExecuting, setIsExecuting] = useState(false);
   const wasExecutingRef = useRef(false);
+  const executionStartTimeRef = useRef(null);
   const [deviceInfo, setDeviceInfo] = useState(null);
   const [executionStats, setExecutionStats] = useState({
     startTime: null,
@@ -145,7 +146,24 @@ export function ProjectProvider({ children }) {
         const data = await res.json();
         if (data && data.execution_id) {
           setExecutionSession(data);
-          setIsExecuting(data.status === 'RUNNING');
+          const isRunningStatus = data.status === 'RUNNING' || data.status === 'STARTING' || data.status === 'QUEUED';
+          setIsExecuting(isRunningStatus);
+
+          if (isRunningStatus && data.start_time) {
+            if (!executionStartTimeRef.current) {
+              executionStartTimeRef.current = data.start_time * 1000;
+            }
+            setExecutionStats((prev) => ({
+              ...prev,
+              startTime: prev.startTime || (data.start_time * 1000),
+            }));
+          } else if (!isRunningStatus && data.status && data.status !== 'IDLE') {
+            setExecutionStats((prev) => ({
+              ...prev,
+              endTime: prev.endTime || Date.now(),
+              totalExecutionTime: data.start_time ? Math.round((Date.now() - (data.start_time * 1000)) / 1000) : prev.totalExecutionTime,
+            }));
+          }
         }
       }
 
@@ -158,7 +176,6 @@ export function ProjectProvider({ children }) {
   };
 
   const fetchDevicesList = async () => {
-    setLoadingDevices(true);
     try {
       const res = await fetch('/api/devices');
       if (res.ok) {
@@ -170,9 +187,19 @@ export function ProjectProvider({ children }) {
 
           if (prev) {
             const foundReal = (data.real_devices || []).find((d) => d.id === prev.id);
-            if (foundReal && isOnline(foundReal)) return foundReal;
+            if (foundReal && isOnline(foundReal)) {
+              if (prev.id === foundReal.id && prev.status === foundReal.status && prev.type === foundReal.type) {
+                return prev;
+              }
+              return foundReal;
+            }
             const foundEmu = (data.emulators || []).find((e) => (e.id && e.id === prev.id) || (e.avd_name && e.avd_name === prev.avd_name));
-            if (foundEmu && isOnline(foundEmu)) return foundEmu;
+            if (foundEmu && isOnline(foundEmu)) {
+              if (prev.id === foundEmu.id && prev.status === foundEmu.status && prev.avd_name === foundEmu.avd_name) {
+                return prev;
+              }
+              return foundEmu;
+            }
           }
 
           const onlineReal = (data.real_devices || []).find(isOnline);
@@ -194,8 +221,6 @@ export function ProjectProvider({ children }) {
       }
     } catch (err) {
       console.error('Failed to fetch devices list:', err);
-    } finally {
-      setLoadingDevices(false);
     }
   };
 
@@ -467,17 +492,23 @@ export function ProjectProvider({ children }) {
     fetchProjects();
   }, []);
 
-  // Live Stopwatch Ticker
+  // Live Stopwatch Ticker (Persistent & Wall-Clock Synchronized)
   useEffect(() => {
     let timer;
     if (isExecuting) {
+      if (!executionStartTimeRef.current) {
+        executionStartTimeRef.current = Date.now();
+      }
       timer = setInterval(() => {
-        setElapsedSeconds((prev) => prev + 1);
+        if (executionStartTimeRef.current) {
+          const diff = Math.max(0, Math.floor((Date.now() - executionStartTimeRef.current) / 1000));
+          setElapsedSeconds(diff);
+        }
       }, 1000);
-    } else {
-      setElapsedSeconds(0);
     }
-    return () => clearInterval(timer);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
   }, [isExecuting]);
 
   // Formatted Elapsed Stopwatch Time (mm:ss)
@@ -517,9 +548,16 @@ export function ProjectProvider({ children }) {
       return;
     }
     requestDesktopNotificationPermission();
+    executionStartTimeRef.current = Date.now();
+    setElapsedSeconds(0);
     setIsExecuting(true);
     setOperatingMode('view');
-    setElapsedSeconds(0);
+    setExecutionStats((prev) => ({
+      ...prev,
+      startTime: Date.now(),
+      endTime: null,
+      totalExecutionTime: 0
+    }));
     showToast(`Triggered test suite for ${activeProject.project_name}`, 'info');
 
     let targetFiles = [];

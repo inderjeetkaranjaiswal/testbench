@@ -26,9 +26,8 @@ export default function ExecutionHistory() {
     selectedTests,
     runTarget,
     selectedDevice,
-    setIsExecuting,
-    setExecutionStats,
-    setOperatingMode,
+    isExecuting,
+    triggerExecution,
     showToast
   } = useProject();
 
@@ -47,17 +46,11 @@ export default function ExecutionHistory() {
     if (!activeProject?.project_name) return;
 
     try {
-      // 1. Fetch current status
+      // 1. Fetch current status (purely informational for this component)
       const statusResp = await fetch(`/api/status/${encodeURIComponent(activeProject.project_name)}`);
       if (statusResp.ok) {
         const sData = await statusResp.json();
         setStatusData(sData);
-
-        if (sData.status === 'Running') {
-          setIsExecuting(true);
-        } else {
-          setIsExecuting(false);
-        }
       }
 
       // 2. Fetch log files list
@@ -87,49 +80,16 @@ export default function ExecutionHistory() {
         clearInterval(pollTimerRef.current);
       }
     };
-  }, [activeProject]);
+  }, [activeProject?.project_name]);
 
   const handleRunTest = async () => {
     if (!activeProject) {
       showToast('Please select an application from the sidebar first', 'warning');
       return;
     }
-
-    setIsExecuting(true);
-    setOperatingMode('view');
     setStatusData((prev) => ({ ...prev, status: 'Running' }));
-    showToast(`Triggered test suite for ${activeProject.project_name}`, 'info');
-
-    let targetFiles = [];
-    if (runTarget === 'selected' && selectedTests && selectedTests.length > 0) {
-      targetFiles = selectedTests;
-    } else if (selectedTest) {
-      targetFiles = [selectedTest];
-    }
-
-    let executeUrl = `/api/execute/${encodeURIComponent(activeProject.project_name)}`;
-    const queryParams = [];
-    if (targetFiles.length > 0) {
-      queryParams.push(`test_file=${encodeURIComponent(targetFiles.join(','))}`);
-    }
-    if (selectedDevice?.id) {
-      queryParams.push(`device_id=${encodeURIComponent(selectedDevice.id)}`);
-    }
-    if (queryParams.length > 0) {
-      executeUrl += `?${queryParams.join('&')}`;
-    }
-
-    try {
-      const resp = await fetch(executeUrl, { method: 'POST' });
-      if (!resp.ok) {
-        throw new Error(`Execution trigger failed with status ${resp.status}`);
-      }
-      fetchStatusAndLogs();
-    } catch (e) {
-      showToast(`Execution Error: ${e.message}`, 'error');
-      setIsExecuting(false);
-      setStatusData((prev) => ({ ...prev, status: 'Failed' }));
-    }
+    await triggerExecution();
+    setTimeout(fetchStatusAndLogs, 500);
   };
 
   const handleViewLog = async (filename) => {
@@ -170,7 +130,7 @@ export default function ExecutionHistory() {
     log.filename.toLowerCase().includes(searchFilter.toLowerCase())
   );
 
-  const isRunning = statusData.status === 'Running';
+  const isRunning = isExecuting || statusData.status === 'Running';
 
   return (
     <div className="flex flex-col h-full bg-white rounded-custom border border-custom-border shadow-xs overflow-hidden select-none">
