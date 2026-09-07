@@ -138,6 +138,7 @@ class DeviceCapturePipeline:
         self._recording_sinks: Dict[str, RecordingSink] = {}
         self._live_queues: Set[asyncio.Queue] = set()
         self._last_config_packet: Optional[H264Packet] = None
+        self._last_key_frame_packet: Optional[H264Packet] = None
         self._video_width: int = 1080
         self._video_height: int = 2400
         self._lock = asyncio.Lock()
@@ -213,7 +214,7 @@ class DeviceCapturePipeline:
             adb_path, "-s", self.device_id, "shell",
             f"CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 2.4 "
             f"scid={scid} tunnel_forward=true max_fps={fps} video_bit_rate=4000000 "
-            f"control=false audio=false cleanup=false send_device_meta=false"
+            f"control=false audio=false cleanup=false send_device_meta=false video_codec_options=i-frame-interval=2"
         ]
 
         self._scrcpy_proc = await asyncio.create_subprocess_exec(
@@ -285,6 +286,8 @@ class DeviceCapturePipeline:
 
                     if is_config:
                         self._last_config_packet = packet
+                    if is_key:
+                        self._last_key_frame_packet = packet
 
                     # Dispatch to all consumers (teeing)
                     await self._dispatch_packet(packet)
@@ -337,6 +340,13 @@ class DeviceCapturePipeline:
         """Registers a live view consumer queue and returns initial config packet and resolution."""
         q = asyncio.Queue(maxsize=60)
         self._live_queues.add(q)
+        # If we have a cached keyframe, pre-seed it at the head of the queue so the new subscriber
+        # immediately receives an anchor I-frame instead of waiting for the next GOP keyframe
+        if self._last_key_frame_packet and self._last_key_frame_packet.data:
+            try:
+                q.put_nowait(self._last_key_frame_packet)
+            except Exception:
+                pass
         return q, self._last_config_packet, self._video_width, self._video_height
 
     def remove_live_queue(self, q: asyncio.Queue):

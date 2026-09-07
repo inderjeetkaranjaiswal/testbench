@@ -21,7 +21,9 @@ import {
   Terminal,
   Boxes,
   ArrowRight,
-  ArrowUpRight
+  ArrowUpRight,
+  Check,
+  Copy
 } from 'lucide-react';
 import { useProject } from '../context/ProjectContext.jsx';
 import LogisticsView from '../components/LogisticsView.jsx';

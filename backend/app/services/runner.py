@@ -27,7 +27,7 @@ from app.services.adb_bridge import (
 from app.services.device_manager import device_manager
 from app.services.capture_pipeline import capture_pipeline_manager
 from app.services.db import start_execution, update_execution_status
-from app.config import get_workspace_dir, get_logs_dir, find_maven, find_npx, find_node
+from app.config import get_workspace_dir, get_logs_dir, find_maven, find_npx, find_node, find_appium
 
 _installed_apks_cache = set()
 
@@ -182,12 +182,18 @@ def start_dedicated_appium_server_sync(
         log_file.write(f"{msg}\n")
         log_file.flush()
 
-    npx_bin = find_npx() or shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+    has_appium, appium_cmd, _ = find_appium()
+    if has_appium and appium_cmd and not appium_cmd.startswith("npx"):
+        appium_args = [appium_cmd, "--port", str(port), "--relaxed-security"]
+    else:
+        npx_bin = find_npx() or shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+        appium_args = [npx_bin, "appium", "--port", str(port), "--relaxed-security"]
+
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
     try:
         proc = subprocess.Popen(
-            [npx_bin, "appium", "--port", str(port), "--relaxed-security"],
+            appium_args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags
@@ -236,12 +242,18 @@ async def start_dedicated_appium_server(
         log_file.write(f"{msg}\n")
         log_file.flush()
 
-    npx_bin = find_npx() or shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+    has_appium, appium_cmd, _ = find_appium()
+    if has_appium and appium_cmd and not appium_cmd.startswith("npx"):
+        appium_args = [appium_cmd, "--port", str(port), "--relaxed-security"]
+    else:
+        npx_bin = find_npx() or shutil.which("npx") or shutil.which("npx.cmd") or "npx"
+        appium_args = [npx_bin, "appium", "--port", str(port), "--relaxed-security"]
+
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
     try:
         proc = subprocess.Popen(
-            [npx_bin, "appium", "--port", str(port), "--relaxed-security"],
+            appium_args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags

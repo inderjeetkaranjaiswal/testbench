@@ -201,6 +201,35 @@ def find_maven(project_root: Optional[Path] = None) -> Optional[str]:
             if p.exists() and p.is_file():
                 return str(p)
 
+    # 4. Search in parent directory (e.g. callhealth folder) and standard locations
+    bin_name = "mvn.cmd" if os.name == 'nt' else "mvn"
+    search_dirs = [
+        BASE_DIR.parent,  # e.g. C:\Users\Bhargav\Documents\callhealth
+        Path(r"C:\Program Files\apache-maven"),
+        Path(r"C:\Program Files (x86)\apache-maven"),
+        Path(r"C:\apache-maven"),
+        Path(r"C:\maven"),
+    ]
+    home = _safe_home()
+    if home:
+        search_dirs.extend([
+            home / "apache-maven",
+            home / "maven",
+            home / ".m2"
+        ])
+
+    for search_dir in search_dirs:
+        if search_dir and search_dir.exists():
+            direct_cand = search_dir / "bin" / bin_name
+            if direct_cand.exists() and direct_cand.is_file():
+                return str(direct_cand)
+            try:
+                for match in search_dir.glob(f"**/{bin_name}"):
+                    if match.exists() and match.is_file() and "bin" in match.parts:
+                        return str(match)
+            except Exception:
+                pass
+
     return None
 
 

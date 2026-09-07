@@ -318,7 +318,7 @@ async def list_projects():
     projects = []
     entries = sorted(list(WORKSPACE_DIR.iterdir()), key=lambda p: p.name.lower())
     for entry in entries:
-        if entry.is_dir() and entry.name != ".gitkeep":
+        if entry.is_dir() and entry.name not in [".gitkeep", "logs", "__pycache__"]:
             inspection = await asyncio.to_thread(inspect_project, str(entry))
             projects.append({
                 "project_name": entry.name,

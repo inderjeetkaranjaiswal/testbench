@@ -58,19 +58,28 @@ export default function EmulatorView() {
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
 
+  // Live Stream & Decoder Refs
+  const spsPpsRef = useRef(null);
+  const hasKeyframeDecodedRef = useRef(false);
+  const currentCodecRef = useRef('avc1.640033');
+  const fallbackTimerRef = useRef(null);
+  const hasLiveFeedRef = useRef(false);
+
   // Gesture Tracking Refs
   const pointerDownTimeRef = useRef(0);
   const pointerDownPosRef = useRef({ x: 0, y: 0 });
   const longPressTimerRef = useRef(null);
   const isDraggingRef = useRef(false);
 
-  const initWebCodecsDecoder = () => {
+  const initWebCodecsDecoder = (codecStr = 'avc1.640033') => {
     if (decoderRef.current && decoderRef.current.state !== 'closed') {
       try {
         decoderRef.current.close();
       } catch (e) {}
     }
     decoderRef.current = null;
+    hasKeyframeDecodedRef.current = false;
+    currentCodecRef.current = codecStr;
 
     if (typeof window !== 'undefined' && window.VideoDecoder) {
       try {
@@ -89,17 +98,25 @@ export default function EmulatorView() {
             }
             frame.close();
             frameCountRef.current += 1;
+            hasLiveFeedRef.current = true;
             setHasLiveFeed(true);
             setConnected(true);
             setErrorMsg(null);
+            // Once hardware decoder produces frames, clear any image fallback to use hardware canvas
+            setFrameSrc((prev) => (prev && prev.startsWith('/api/stream') ? null : prev));
           },
           error: (e) => {
             console.warn('[WebCodecs VideoDecoder]', e);
+            // On hardware decoder error, smoothly activate HTTP MJPEG fallback
+            if (selectedDevice?.id && !hasLiveFeedRef.current) {
+              setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+              setHasLiveFeed(true);
+            }
           }
         });
 
         decoder.configure({
-          codec: 'avc1.42001f',
+          codec: codecStr,
           optimizeForLatency: true,
           hardwareAcceleration: 'prefer-hardware'
         });
@@ -107,17 +124,38 @@ export default function EmulatorView() {
         decoderRef.current = decoder;
       } catch (err) {
         console.warn('[WebCodecs init warning]', err);
+        if (selectedDevice?.id) {
+          setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+        }
       }
     }
   };
 
   const connectWebSocket = () => {
     setErrorMsg(null);
+    hasLiveFeedRef.current = false;
+    spsPpsRef.current = null;
+    hasKeyframeDecodedRef.current = false;
+
     if (wsRef.current) {
       wsRef.current.close();
     }
+    if (fallbackTimerRef.current) {
+      clearTimeout(fallbackTimerRef.current);
+    }
 
-    initWebCodecsDecoder();
+    initWebCodecsDecoder('avc1.640033');
+
+    // 2.5s fallback: if WebCodecs takes time to receive first IDR keyframe or device screen is static,
+    // seamlessly activate HTTP MJPEG stream so user sees live display immediately
+    fallbackTimerRef.current = setTimeout(() => {
+      if (!hasLiveFeedRef.current && selectedDevice?.id) {
+        console.log('[LiveStream] Activating HTTP MJPEG stream fallback');
+        setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+        setHasLiveFeed(true);
+        setConnected(true);
+      }
+    }, 2500);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const deviceQuery = selectedDevice?.id ? `?device_id=${encodeURIComponent(selectedDevice.id)}` : '';
@@ -155,6 +193,7 @@ export default function EmulatorView() {
 
           if (text.startsWith('data:image/')) {
             setFrameSrc(text);
+            hasLiveFeedRef.current = true;
             setHasLiveFeed(true);
             setConnected(true);
             setErrorMsg(null);
@@ -165,18 +204,64 @@ export default function EmulatorView() {
           const u8 = new Uint8Array(buffer);
           if (u8.length === 0) return;
 
-          // Check if packet contains IDR keyframe (NAL 5) or SPS (NAL 7)
-          let isKey = false;
+          // Parse NAL unit type & offset
+          let nalType = null;
+          let nalOffset = 0;
           for (let i = 0; i < Math.min(u8.length - 4, 32); i++) {
-            if ((u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) ||
-                (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && u8[i + 3] === 1)) {
-              const nalOffset = u8[i + 2] === 1 ? i + 3 : i + 4;
-              const nalType = u8[nalOffset] & 0x1f;
-              if (nalType === 5 || nalType === 7) {
-                isKey = true;
-                break;
+            if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) {
+              nalOffset = i + 3;
+              nalType = u8[nalOffset] & 0x1f;
+              break;
+            } else if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && u8[i + 3] === 1) {
+              nalOffset = i + 4;
+              nalType = u8[nalOffset] & 0x1f;
+              break;
+            }
+          }
+
+          // Case A: Parameter Set (SPS NAL 7)
+          if (nalType === 7) {
+            if (nalOffset + 3 < u8.length) {
+              const profile = u8[nalOffset + 1].toString(16).padStart(2, '0');
+              const constraints = u8[nalOffset + 2].toString(16).padStart(2, '0');
+              const level = u8[nalOffset + 3].toString(16).padStart(2, '0');
+              const detectedCodec = `avc1.${profile}${constraints}${level}`;
+              if (currentCodecRef.current !== detectedCodec) {
+                initWebCodecsDecoder(detectedCodec);
               }
             }
+            spsPpsRef.current = u8;
+            return; // SPS is parameter set, don't feed alone to decode()
+          }
+
+          // Case B: PPS NAL 8
+          if (nalType === 8) {
+            if (spsPpsRef.current) {
+              const combined = new Uint8Array(spsPpsRef.current.length + u8.length);
+              combined.set(spsPpsRef.current, 0);
+              combined.set(u8, spsPpsRef.current.length);
+              spsPpsRef.current = combined;
+            } else {
+              spsPpsRef.current = u8;
+            }
+            return;
+          }
+
+          const isKey = nalType === 5;
+
+          // If we haven't decoded a keyframe yet and this is not a keyframe,
+          // wait for next keyframe to prevent decoder errors / visual artifacts
+          if (!isKey && !hasKeyframeDecodedRef.current) {
+            return;
+          }
+
+          let packetToSend = u8;
+          if (isKey && spsPpsRef.current) {
+            // Concatenate SPS/PPS directly with IDR keyframe chunk for Annex B
+            const combined = new Uint8Array(spsPpsRef.current.length + u8.length);
+            combined.set(spsPpsRef.current, 0);
+            combined.set(u8, spsPpsRef.current.length);
+            packetToSend = combined;
           }
 
           const decoder = decoderRef.current;
@@ -185,10 +270,13 @@ export default function EmulatorView() {
               decoder.decode(new window.EncodedVideoChunk({
                 type: isKey ? 'key' : 'delta',
                 timestamp: Math.round(performance.now() * 1000),
-                data: u8
+                data: packetToSend
               }));
+              if (isKey) {
+                hasKeyframeDecodedRef.current = true;
+              }
             } catch (decErr) {
-              // Wait for next keyframe if stream started mid-GOP
+              // Wait for next keyframe if mid-GOP packet
             }
           }
         } else if (event.data instanceof Blob) {
@@ -199,6 +287,7 @@ export default function EmulatorView() {
             }
             return url;
           });
+          hasLiveFeedRef.current = true;
           setHasLiveFeed(true);
           setConnected(true);
           setErrorMsg(null);
@@ -207,17 +296,32 @@ export default function EmulatorView() {
       };
 
       ws.onerror = () => {
-        setConnected(false);
-        setHasLiveFeed(false);
-        setErrorMsg('Failed to connect to ADB emulator stream');
+        if (selectedDevice?.id) {
+          setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+          hasLiveFeedRef.current = true;
+          setHasLiveFeed(true);
+          setConnected(true);
+        } else {
+          setConnected(false);
+          setHasLiveFeed(false);
+          setErrorMsg('Failed to connect to ADB emulator stream');
+        }
       };
 
       ws.onclose = () => {
-        setConnected(false);
-        setHasLiveFeed(false);
+        if (!hasLiveFeedRef.current) {
+          setConnected(false);
+          setHasLiveFeed(false);
+        }
       };
     } catch (e) {
-      setErrorMsg(`Connection error: ${e.message}`);
+      if (selectedDevice?.id) {
+        setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+        setHasLiveFeed(true);
+        setConnected(true);
+      } else {
+        setErrorMsg(`Connection error: ${e.message}`);
+      }
     }
   };
 
@@ -232,6 +336,9 @@ export default function EmulatorView() {
 
     return () => {
       clearInterval(fpsInterval);
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
+      }
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -643,7 +750,7 @@ export default function EmulatorView() {
             operatingMode === 'interactive' && !isExecuting ? 'cursor-crosshair' : 'cursor-default'
           }`}
         >
-          {connected ? (
+          {connected || frameSrc ? (
             <>
               {!hasLiveFeed && !frameSrc && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-xs text-slate-400 space-y-2 z-10">
@@ -663,6 +770,19 @@ export default function EmulatorView() {
                   src={frameSrc}
                   alt="Android ADB Live Screen Stream"
                   className="w-full h-full object-contain pointer-events-none"
+                  onLoad={() => {
+                    hasLiveFeedRef.current = true;
+                    setHasLiveFeed(true);
+                    setConnected(true);
+                    setErrorMsg(null);
+                  }}
+                  onError={() => {
+                    setTimeout(() => {
+                      if (!hasLiveFeedRef.current && selectedDevice?.id) {
+                        setFrameSrc(`/api/stream/${encodeURIComponent(selectedDevice.id)}?t=${Date.now()}`);
+                      }
+                    }, 1500);
+                  }}
                 />
               )}
             </>
