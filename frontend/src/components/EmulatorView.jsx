@@ -22,18 +22,27 @@ import {
   Send,
   X,
   MonitorPlay,
-  Settings
+  Settings,
+  Copy,
+  Check,
+  Download,
+  ExternalLink
 } from 'lucide-react';
 import TelemetryBar from './TelemetryBar.jsx';
 import { useProject } from '../context/ProjectContext.jsx';
 
 export default function EmulatorView() {
-  const { operatingMode, setOperatingMode, isExecuting, selectedDevice, startEmulator, fetchDevicesList } = useProject();
+  const { operatingMode, setOperatingMode, isExecuting, selectedDevice, startEmulator, fetchDevicesList, showToast } = useProject();
 
   const [frameSrc, setFrameSrc] = useState(null);
+  const [hasLiveFeed, setHasLiveFeed] = useState(false);
   const [connected, setConnected] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [fps, setFps] = useState(0);
+
+  // Screenshot Floating Preview State
+  const [screenshotPreview, setScreenshotPreview] = useState(null);
+  const [copiedImage, setCopiedImage] = useState(false);
 
   // Quick Action States
   const [showTextInput, setShowTextInput] = useState(false);
@@ -43,8 +52,11 @@ export default function EmulatorView() {
   const [selectedResolution, setSelectedResolution] = useState('1080x2400');
 
   const wsRef = useRef(null);
+  const decoderRef = useRef(null);
   const frameCountRef = useRef(0);
   const screenRef = useRef(null);
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
 
   // Gesture Tracking Refs
   const pointerDownTimeRef = useRef(0);
@@ -52,11 +64,60 @@ export default function EmulatorView() {
   const longPressTimerRef = useRef(null);
   const isDraggingRef = useRef(false);
 
+  const initWebCodecsDecoder = () => {
+    if (decoderRef.current && decoderRef.current.state !== 'closed') {
+      try {
+        decoderRef.current.close();
+      } catch (e) {}
+    }
+    decoderRef.current = null;
+
+    if (typeof window !== 'undefined' && window.VideoDecoder) {
+      try {
+        const decoder = new window.VideoDecoder({
+          output: (frame) => {
+            const canvas = canvasRef.current;
+            if (canvas) {
+              if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                canvas.width = frame.displayWidth;
+                canvas.height = frame.displayHeight;
+              }
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.drawImage(frame, 0, 0);
+              }
+            }
+            frame.close();
+            frameCountRef.current += 1;
+            setHasLiveFeed(true);
+            setConnected(true);
+            setErrorMsg(null);
+          },
+          error: (e) => {
+            console.warn('[WebCodecs VideoDecoder]', e);
+          }
+        });
+
+        decoder.configure({
+          codec: 'avc1.42001f',
+          optimizeForLatency: true,
+          hardwareAcceleration: 'prefer-hardware'
+        });
+
+        decoderRef.current = decoder;
+      } catch (err) {
+        console.warn('[WebCodecs init warning]', err);
+      }
+    }
+  };
+
   const connectWebSocket = () => {
     setErrorMsg(null);
     if (wsRef.current) {
       wsRef.current.close();
     }
+
+    initWebCodecsDecoder();
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const deviceQuery = selectedDevice?.id ? `?device_id=${encodeURIComponent(selectedDevice.id)}` : '';
@@ -64,6 +125,7 @@ export default function EmulatorView() {
 
     try {
       const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -72,15 +134,72 @@ export default function EmulatorView() {
       };
 
       ws.onmessage = (event) => {
-        const text = event.data;
-        if (text.startsWith('ERR:')) {
-          setErrorMsg(text.replace('ERR:', '').trim());
-          setConnected(false);
-          return;
-        }
+        if (typeof event.data === 'string') {
+          const text = event.data;
+          if (text.startsWith('ERR:')) {
+            setErrorMsg(text.replace('ERR:', '').trim());
+            setConnected(false);
+            setHasLiveFeed(false);
+            return;
+          }
 
-        if (text.startsWith('data:image/')) {
-          setFrameSrc(text);
+          if (text.startsWith('{')) {
+            try {
+              const meta = JSON.parse(text);
+              if (meta.type === 'stream_meta' && meta.width && meta.height) {
+                setSelectedResolution(`${meta.width}x${meta.height}`);
+              }
+            } catch (e) {}
+            return;
+          }
+
+          if (text.startsWith('data:image/')) {
+            setFrameSrc(text);
+            setHasLiveFeed(true);
+            setConnected(true);
+            setErrorMsg(null);
+            frameCountRef.current += 1;
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          const buffer = event.data;
+          const u8 = new Uint8Array(buffer);
+          if (u8.length === 0) return;
+
+          // Check if packet contains IDR keyframe (NAL 5) or SPS (NAL 7)
+          let isKey = false;
+          for (let i = 0; i < Math.min(u8.length - 4, 32); i++) {
+            if ((u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) ||
+                (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && u8[i + 3] === 1)) {
+              const nalOffset = u8[i + 2] === 1 ? i + 3 : i + 4;
+              const nalType = u8[nalOffset] & 0x1f;
+              if (nalType === 5 || nalType === 7) {
+                isKey = true;
+                break;
+              }
+            }
+          }
+
+          const decoder = decoderRef.current;
+          if (decoder && decoder.state === 'configured') {
+            try {
+              decoder.decode(new window.EncodedVideoChunk({
+                type: isKey ? 'key' : 'delta',
+                timestamp: Math.round(performance.now() * 1000),
+                data: u8
+              }));
+            } catch (decErr) {
+              // Wait for next keyframe if stream started mid-GOP
+            }
+          }
+        } else if (event.data instanceof Blob) {
+          const url = URL.createObjectURL(event.data);
+          setFrameSrc((prevUrl) => {
+            if (prevUrl && prevUrl.startsWith('blob:')) {
+              URL.revokeObjectURL(prevUrl);
+            }
+            return url;
+          });
+          setHasLiveFeed(true);
           setConnected(true);
           setErrorMsg(null);
           frameCountRef.current += 1;
@@ -89,11 +208,13 @@ export default function EmulatorView() {
 
       ws.onerror = () => {
         setConnected(false);
+        setHasLiveFeed(false);
         setErrorMsg('Failed to connect to ADB emulator stream');
       };
 
       ws.onclose = () => {
         setConnected(false);
+        setHasLiveFeed(false);
       };
     } catch (e) {
       setErrorMsg(`Connection error: ${e.message}`);
@@ -113,6 +234,11 @@ export default function EmulatorView() {
       clearInterval(fpsInterval);
       if (wsRef.current) {
         wsRef.current.close();
+      }
+      if (decoderRef.current && decoderRef.current.state !== 'closed') {
+        try {
+          decoderRef.current.close();
+        } catch (e) {}
       }
     };
   }, [selectedDevice?.id]);
@@ -143,11 +269,9 @@ export default function EmulatorView() {
     }
   };
 
-  const imgRef = useRef(null);
-
-  // Compute normalized coordinates (0.0 to 1.0) on the screen image element
+  // Compute normalized coordinates (0.0 to 1.0) on the screen image/canvas element
   const getNormalizedCoords = (e) => {
-    const targetElement = imgRef.current || screenRef.current;
+    const targetElement = canvasRef.current || imgRef.current || screenRef.current;
     if (!targetElement) return { normX: 0.5, normY: 0.5 };
 
     const rect = targetElement.getBoundingClientRect();
@@ -245,18 +369,56 @@ export default function EmulatorView() {
     sendControlAction('rotate', { rotation: nextRot });
   };
 
-  // Screenshot Capture & Download
-  const handleTakeScreenshot = async () => {
-    if (frameSrc) {
-      const a = document.createElement('a');
-      a.href = frameSrc;
-      a.download = `device_screenshot_${Date.now()}.jpg`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setLastActionStatus('Screenshot Saved');
-      setTimeout(() => setLastActionStatus(''), 2000);
+  // Screenshot Capture & Floating Drawer Preview
+  const handleTakeScreenshot = () => {
+    let imgSrc = frameSrc;
+    if (canvasRef.current) {
+      try {
+        imgSrc = canvasRef.current.toDataURL('image/png');
+      } catch (e) {}
     }
+
+    if (imgSrc) {
+      setScreenshotPreview({
+        src: imgSrc,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+      setCopiedImage(false);
+      showToast('Screenshot captured', 'success', 2500);
+    } else {
+      showToast('No active screen frame to capture', 'warning');
+    }
+  };
+
+  const handleCopyScreenshotToClipboard = async () => {
+    if (!screenshotPreview?.src) return;
+    try {
+      const res = await fetch(screenshotPreview.src);
+      const blob = await res.blob();
+      if (typeof window !== 'undefined' && navigator.clipboard && window.ClipboardItem) {
+        await navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': blob })
+        ]);
+        setCopiedImage(true);
+        setTimeout(() => setCopiedImage(false), 2000);
+        showToast('Screenshot copied to clipboard!', 'success');
+      } else {
+        showToast('Clipboard image copy not supported in this browser', 'info');
+      }
+    } catch (e) {
+      showToast('Failed to copy image to clipboard', 'error');
+    }
+  };
+
+  const handleDownloadScreenshot = () => {
+    if (!screenshotPreview?.src) return;
+    const a = document.createElement('a');
+    a.href = screenshotPreview.src;
+    a.download = `testbench_screenshot_${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showToast('Downloaded screenshot PNG', 'info', 2000);
   };
 
   return (
@@ -470,6 +632,7 @@ export default function EmulatorView() {
 
         {/* Interactive Screen Display Area */}
         <div
+          id="emulator-screen-viewport"
           ref={screenRef}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -480,14 +643,29 @@ export default function EmulatorView() {
             operatingMode === 'interactive' && !isExecuting ? 'cursor-crosshair' : 'cursor-default'
           }`}
         >
-          {frameSrc && connected ? (
-            <img
-              ref={imgRef}
-              id="emulator-screen-img"
-              src={frameSrc}
-              alt="Android ADB Live Screen Stream"
-              className="w-full h-full object-contain pointer-events-none"
-            />
+          {connected ? (
+            <>
+              {!hasLiveFeed && !frameSrc && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-xs text-slate-400 space-y-2 z-10">
+                  <RefreshCw className="h-6 w-6 animate-spin text-indigo-400" />
+                  <p className="text-xs font-medium">Connecting to live screen stream...</p>
+                </div>
+              )}
+              <canvas
+                ref={canvasRef}
+                id="emulator-screen-canvas"
+                className={`w-full h-full object-contain pointer-events-none ${frameSrc ? 'hidden' : 'block'}`}
+              />
+              {frameSrc && (
+                <img
+                  ref={imgRef}
+                  id="emulator-screen-img"
+                  src={frameSrc}
+                  alt="Android ADB Live Screen Stream"
+                  className="w-full h-full object-contain pointer-events-none"
+                />
+              )}
+            </>
           ) : (
             <div className="p-6 text-center space-y-4 max-w-xs">
               <div className="w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center mx-auto text-slate-500">
@@ -592,6 +770,44 @@ export default function EmulatorView() {
             <X className="h-4 w-4" />
           </button>
         </form>
+      )}
+
+      {/* Floating Screenshot Preview Toast Drawer */}
+      {screenshotPreview && (
+        <div className="absolute bottom-4 right-4 z-40 bg-white border border-slate-200 rounded-2xl shadow-2xl p-3 flex items-center gap-3 animate-in slide-in-from-bottom-3 fade-in duration-200 max-w-sm">
+          <img
+            src={screenshotPreview.src}
+            alt="Captured screen"
+            className="w-12 h-20 object-contain rounded-lg border border-slate-200 bg-slate-950 shrink-0"
+          />
+          <div className="space-y-1.5 min-w-0 flex-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold text-slate-900">Screenshot Ready</span>
+              <button
+                onClick={() => setScreenshotPreview(null)}
+                className="p-0.5 text-slate-400 hover:text-slate-600 transition"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={handleCopyScreenshotToClipboard}
+                className="px-2.5 py-1 rounded-md bg-blue-50 hover:bg-blue-100 text-blue-700 text-[10px] font-bold flex items-center gap-1 transition cursor-pointer"
+              >
+                {copiedImage ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+                <span>{copiedImage ? 'Copied!' : 'Copy Image'}</span>
+              </button>
+              <button
+                onClick={handleDownloadScreenshot}
+                className="px-2.5 py-1 rounded-md bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold flex items-center gap-1 transition cursor-pointer"
+              >
+                <Download className="h-3 w-3" />
+                <span>Save</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

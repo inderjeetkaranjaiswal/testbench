@@ -14,7 +14,8 @@ import {
   X,
   Copy,
   Search,
-  Check
+  Check,
+  Video
 } from 'lucide-react';
 import { useProject } from '../context/ProjectContext.jsx';
 
@@ -24,9 +25,11 @@ export default function ExecutionHistory() {
     selectedTest,
     selectedTests,
     runTarget,
+    selectedDevice,
     setIsExecuting,
     setExecutionStats,
-    setOperatingMode
+    setOperatingMode,
+    showToast
   } = useProject();
 
   const [statusData, setStatusData] = useState({ status: 'Idle', log_file: null });
@@ -34,6 +37,7 @@ export default function ExecutionHistory() {
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [searchFilter, setSearchFilter] = useState('');
   const [selectedLogModal, setSelectedLogModal] = useState(null); // { filename, content, loading }
+  const [selectedVideoModal, setSelectedVideoModal] = useState(null); // { filename, title }
   const [copied, setCopied] = useState(false);
 
   const pollTimerRef = useRef(null);
@@ -87,13 +91,14 @@ export default function ExecutionHistory() {
 
   const handleRunTest = async () => {
     if (!activeProject) {
-      alert('Please select an uploaded application from the sidebar first.');
+      showToast('Please select an application from the sidebar first', 'warning');
       return;
     }
 
     setIsExecuting(true);
     setOperatingMode('view');
     setStatusData((prev) => ({ ...prev, status: 'Running' }));
+    showToast(`Triggered test suite for ${activeProject.project_name}`, 'info');
 
     let targetFiles = [];
     if (runTarget === 'selected' && selectedTests && selectedTests.length > 0) {
@@ -103,8 +108,15 @@ export default function ExecutionHistory() {
     }
 
     let executeUrl = `/api/execute/${encodeURIComponent(activeProject.project_name)}`;
+    const queryParams = [];
     if (targetFiles.length > 0) {
-      executeUrl += `?test_file=${encodeURIComponent(targetFiles.join(','))}`;
+      queryParams.push(`test_file=${encodeURIComponent(targetFiles.join(','))}`);
+    }
+    if (selectedDevice?.id) {
+      queryParams.push(`device_id=${encodeURIComponent(selectedDevice.id)}`);
+    }
+    if (queryParams.length > 0) {
+      executeUrl += `?${queryParams.join('&')}`;
     }
 
     try {
@@ -114,7 +126,7 @@ export default function ExecutionHistory() {
       }
       fetchStatusAndLogs();
     } catch (e) {
-      alert(`Execution Error: ${e.message}`);
+      showToast(`Execution Error: ${e.message}`, 'error');
       setIsExecuting(false);
       setStatusData((prev) => ({ ...prev, status: 'Failed' }));
     }
@@ -142,6 +154,7 @@ export default function ExecutionHistory() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    showToast(`Downloading ${filename}`, 'info', 2000);
   };
 
   const handleCopyContent = () => {
@@ -149,6 +162,7 @@ export default function ExecutionHistory() {
       navigator.clipboard.writeText(selectedLogModal.content);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+      showToast('Log content copied to clipboard', 'success');
     }
   };
 
@@ -251,8 +265,25 @@ export default function ExecutionHistory() {
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-2 px-3 py-1 rounded-md bg-amber-500/10 text-amber-700 text-xs font-mono font-bold">
-              <Clock className="h-3.5 w-3.5 animate-pulse" /> Active Pipeline
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 px-3 py-1 rounded-md bg-amber-500/10 text-amber-700 text-xs font-mono font-bold">
+                <Clock className="h-3.5 w-3.5 animate-pulse" /> Active Pipeline
+              </div>
+              {statusData.execution_id && (
+                <button
+                  onClick={async () => {
+                    try {
+                      await fetch(`/api/executions/${encodeURIComponent(statusData.execution_id)}/cancel`, { method: 'POST' });
+                      fetchStatusAndLogs();
+                    } catch (e) {
+                      console.error('Failed to cancel execution:', e);
+                    }
+                  }}
+                  className="px-3 py-1 rounded-md bg-rose-100 hover:bg-rose-200 text-rose-700 font-sans font-bold text-xs transition cursor-pointer flex items-center gap-1 shadow-2xs"
+                >
+                  <Square className="h-3 w-3 fill-current" /> Cancel Run
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -303,6 +334,19 @@ export default function ExecutionHistory() {
                       <td className="py-3 px-4 text-right">
                         <div className="flex items-center justify-end gap-2">
                           <button
+                            onClick={() => {
+                              const recName = log.filename.replace('.log', '.mp4');
+                              setSelectedVideoModal({
+                                filename: recName,
+                                title: `${activeProject?.project_name} - ${log.filename.replace('.log', '')}`
+                              });
+                            }}
+                            className="px-2.5 py-1.5 rounded-md border border-indigo-200 bg-indigo-50/80 hover:bg-indigo-100 text-indigo-700 font-sans font-semibold text-xs transition flex items-center gap-1.5 shadow-2xs cursor-pointer"
+                            title="Watch Screen Recording"
+                          >
+                            <Video className="h-3.5 w-3.5 text-indigo-600" /> Watch Video
+                          </button>
+                          <button
                             onClick={() => handleViewLog(log.filename)}
                             className="px-2.5 py-1.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-sans font-semibold text-xs transition flex items-center gap-1.5 shadow-2xs cursor-pointer"
                           >
@@ -324,6 +368,52 @@ export default function ExecutionHistory() {
           </div>
         )}
       </div>
+
+      {/* Video Screen Recording Modal */}
+      {selectedVideoModal && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center z-50 p-4 animate-fade-in">
+          <div className="bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-2xl max-w-4xl w-full flex flex-col overflow-hidden">
+            {/* Modal Header */}
+            <div className="px-6 py-4 border-b border-slate-800 bg-slate-900/80 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <Video className="h-5 w-5 text-indigo-400" />
+                <div>
+                  <h3 className="text-sm font-bold text-slate-100 font-mono">{selectedVideoModal.title}</h3>
+                  <p className="text-[11px] text-slate-400">Synchronized Device Screen Recording (.mp4)</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <a
+                  href={`/api/recordings/${encodeURIComponent(selectedVideoModal.filename)}?download=true`}
+                  download
+                  className="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Download className="h-3.5 w-3.5" /> Download .mp4
+                </a>
+                <button
+                  onClick={() => setSelectedVideoModal(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Video Player Body */}
+            <div className="p-4 bg-slate-950 flex items-center justify-center">
+              <video
+                controls
+                autoPlay
+                src={`/api/recordings/${encodeURIComponent(selectedVideoModal.filename)}`}
+                className="w-full max-h-[70vh] rounded-lg bg-black object-contain shadow-inner"
+              >
+                Your browser does not support the video tag.
+              </video>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Raw Text Log View Modal */}
       {selectedLogModal && (

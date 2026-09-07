@@ -1,4 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import { CheckCircle2, AlertCircle, Info, AlertTriangle, X } from 'lucide-react';
+import ShortcutsModal from '../components/ShortcutsModal.jsx';
 
 const ProjectContext = createContext(null);
 
@@ -12,7 +14,9 @@ export function ProjectProvider({ children }) {
   const [loadingProjects, setLoadingProjects] = useState(false);
   const [loadingTests, setLoadingTests] = useState(false);
   const [generatedReport, setGeneratedReport] = useState(null);
-  
+  const [showShortcutsModal, setShowShortcutsModal] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
   // Single Source of Truth Execution Session State
   const [executionSession, setExecutionSession] = useState({
     execution_id: '',
@@ -28,9 +32,84 @@ export function ProjectProvider({ children }) {
     error_message: ''
   });
 
+  // Global Toasts & Notification Feed
+  const [toasts, setToasts] = useState([]);
+  const [notifications, setNotifications] = useState(() => [
+    {
+      id: 'notif-1',
+      title: 'Platform Ready',
+      message: 'FastAPI Backend & ADB Bridges initialized and online.',
+      time: 'Just now',
+      type: 'success',
+      read: false,
+    },
+    {
+      id: 'notif-2',
+      title: 'Workspace Active',
+      message: 'Workspace directory synchronized with auto-discovery.',
+      time: '1m ago',
+      type: 'info',
+      read: false,
+    },
+  ]);
+
+  const showToast = (message, type = 'info', duration = 3500) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, duration);
+  };
+
+  const removeToast = (id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  const addNotification = (title, message, type = 'info') => {
+    const newNotif = {
+      id: `notif-${Date.now()}`,
+      title,
+      message,
+      time: 'Just now',
+      type,
+      read: false,
+    };
+    setNotifications((prev) => [newNotif, ...prev]);
+
+    // Also trigger native desktop notification if window is hidden
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted' && document.hidden) {
+      try {
+        new Notification(`TestBench: ${title}`, {
+          body: message,
+          icon: '/testbench-logo.png',
+        });
+      } catch (e) {}
+    }
+  };
+
+  const markAllNotificationsRead = () => {
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+  };
+
+  const clearNotifications = () => {
+    setNotifications([]);
+  };
+
+  const unreadNotificationsCount = notifications.filter((n) => !n.read).length;
+
+  // Request browser desktop notification permission
+  const requestDesktopNotificationPermission = async () => {
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      try {
+        await Notification.requestPermission();
+      } catch (e) {}
+    }
+  };
+
   // Interactive Mirroring & Execution Telemetry States
   const [operatingMode, setOperatingMode] = useState('view'); // 'view' | 'interactive'
   const [isExecuting, setIsExecuting] = useState(false);
+  const wasExecutingRef = useRef(false);
   const [deviceInfo, setDeviceInfo] = useState(null);
   const [executionStats, setExecutionStats] = useState({
     startTime: null,
@@ -53,16 +132,25 @@ export function ProjectProvider({ children }) {
   const [selectedDevice, setSelectedDevice] = useState(null);
   const [loadingDevices, setLoadingDevices] = useState(false);
   const [startingEmulator, setStartingEmulator] = useState(null);
+  // Multi-session tracking
+  const [activeSessions, setActiveSessions] = useState([]);
 
   const fetchExecutionSession = async () => {
     try {
-      const res = await fetch('/api/execution/session');
+      const devQuery = selectedDevice?.id ? `?device_id=${encodeURIComponent(selectedDevice.id)}` : '';
+      const res = await fetch(`/api/execution/session${devQuery}`);
       if (res.ok) {
         const data = await res.json();
         if (data && data.execution_id) {
           setExecutionSession(data);
           setIsExecuting(data.status === 'RUNNING');
         }
+      }
+
+      const sessionsRes = await fetch('/api/execution/sessions');
+      if (sessionsRes.ok) {
+        const sData = await sessionsRes.json();
+        setActiveSessions(sData.sessions || []);
       }
     } catch (err) {}
   };
@@ -76,28 +164,25 @@ export function ProjectProvider({ children }) {
         setDevicesList(data);
 
         setSelectedDevice((prev) => {
+          const isOnline = (d) => Boolean(d && (d.id || d.status === 'running' || d.status === 'available' || d.status === 'busy'));
+
           if (prev) {
             const foundReal = (data.real_devices || []).find((d) => d.id === prev.id);
-            if (foundReal) return foundReal;
-            const foundEmu = (data.emulators || []).find((e) => (e.id && e.id === prev.id) || e.avd_name === prev.avd_name);
+            if (foundReal && isOnline(foundReal)) return foundReal;
+            const foundEmu = (data.emulators || []).find((e) => (e.id && e.id === prev.id) || (e.avd_name && e.avd_name === prev.avd_name));
+            if (foundEmu && isOnline(foundEmu)) return foundEmu;
+          }
+
+          const onlineReal = (data.real_devices || []).find(isOnline);
+          if (onlineReal) return onlineReal;
+
+          const onlineEmu = (data.emulators || []).find(isOnline);
+          if (onlineEmu) return onlineEmu;
+
+          if (prev) {
+            const foundEmu = (data.emulators || []).find((e) => (e.id && e.id === prev.id) || (e.avd_name && e.avd_name === prev.avd_name));
             if (foundEmu) return foundEmu;
           }
-
-          if (data.real_devices && data.real_devices.length > 0) {
-            return data.real_devices[0];
-          }
-          const pixel6aRunning = (data.emulators || []).find(
-            (e) => e.status === 'running' && (e.avd_name === 'Pixel_6a' || e.name?.toLowerCase().includes('pixel 6a'))
-          );
-          if (pixel6aRunning) return pixel6aRunning;
-
-          const runningEmu = (data.emulators || []).find((e) => e.status === 'running');
-          if (runningEmu) return runningEmu;
-
-          const pixel6aAvd = (data.emulators || []).find(
-            (e) => e.avd_name === 'Pixel_6a' || e.name?.toLowerCase().includes('pixel 6a')
-          );
-          if (pixel6aAvd) return pixel6aAvd;
 
           if (data.emulators && data.emulators.length > 0) {
             return data.emulators[0];
@@ -213,7 +298,26 @@ export function ProjectProvider({ children }) {
       const res = await fetch('/api/projects');
       if (res.ok) {
         const data = await res.json();
-        setProjectsList(data.projects || []);
+        const projects = data.projects || [];
+        setProjectsList(projects);
+
+        // Auto-select saved or first available project if none active
+        setActiveProject((current) => {
+          if (current) return current;
+          const savedName = localStorage.getItem('tb_active_project');
+          if (savedName) {
+            const matched = projects.find((p) => p.project_name === savedName);
+            if (matched) {
+              selectProject(matched);
+              return matched;
+            }
+          }
+          if (projects.length > 0) {
+            selectProject(projects[0]);
+            return projects[0];
+          }
+          return null;
+        });
       }
     } catch (err) {
       console.error('Failed to fetch projects list:', err);
@@ -224,6 +328,7 @@ export function ProjectProvider({ children }) {
 
   const selectProject = async (project) => {
     if (!project) {
+      localStorage.removeItem('tb_active_project');
       setActiveProject(null);
       setSelectedTest(null);
       setSelectedTests([]);
@@ -232,6 +337,7 @@ export function ProjectProvider({ children }) {
     }
 
     const name = typeof project === 'string' ? project : project.project_name;
+    localStorage.setItem('tb_active_project', name);
     setLoadingTests(true);
     setSelectedTest(null);
     setSelectedTests([]);
@@ -278,6 +384,122 @@ export function ProjectProvider({ children }) {
     fetchProjects();
   }, []);
 
+  // Live Stopwatch Ticker
+  useEffect(() => {
+    let timer;
+    if (isExecuting) {
+      timer = setInterval(() => {
+        setElapsedSeconds((prev) => prev + 1);
+      }, 1000);
+    } else {
+      setElapsedSeconds(0);
+    }
+    return () => clearInterval(timer);
+  }, [isExecuting]);
+
+  // Formatted Elapsed Stopwatch Time (mm:ss)
+  const formatSeconds = (sec) => {
+    const m = Math.floor(sec / 60).toString().padStart(2, '0');
+    const s = (sec % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  };
+  const formattedElapsedTime = formatSeconds(elapsedSeconds);
+
+  // Dynamic Browser Tab Title & Completion Notifications
+  useEffect(() => {
+    if (isExecuting) {
+      document.title = `(▶ ${formattedElapsedTime}) ${activeProject?.project_name || 'TestBench'} - Running`;
+      wasExecutingRef.current = true;
+    } else {
+      if (wasExecutingRef.current) {
+        document.title = `(✓ Done) ${activeProject?.project_name || 'TestBench'}`;
+        addNotification(
+          'Execution Finished',
+          `Test suite on ${activeProject?.project_name || 'project'} finished in ${formatSeconds(elapsedSeconds || 1)}.`,
+          'success'
+        );
+        wasExecutingRef.current = false;
+        setTimeout(() => {
+          document.title = 'TestBench - TEST • VALIDATE • DELIVER';
+        }, 5000);
+      } else {
+        document.title = 'TestBench - TEST • VALIDATE • DELIVER';
+      }
+    }
+  }, [isExecuting, formattedElapsedTime, activeProject?.project_name]);
+
+  const triggerExecution = async () => {
+    if (!activeProject) {
+      showToast('Please select an application to run tests', 'warning');
+      return;
+    }
+    requestDesktopNotificationPermission();
+    setIsExecuting(true);
+    setOperatingMode('view');
+    setElapsedSeconds(0);
+    showToast(`Triggered test suite for ${activeProject.project_name}`, 'info');
+
+    let targetFiles = [];
+    if (runTarget === 'selected' && selectedTests && selectedTests.length > 0) {
+      targetFiles = selectedTests;
+    } else if (selectedTest) {
+      targetFiles = [selectedTest];
+    }
+
+    let executeUrl = `/api/execute/${encodeURIComponent(activeProject.project_name)}`;
+    const queryParams = [];
+    if (targetFiles.length > 0) {
+      queryParams.push(`test_file=${encodeURIComponent(targetFiles.join(','))}`);
+    }
+    if (selectedDevice?.id) {
+      queryParams.push(`device_id=${encodeURIComponent(selectedDevice.id)}`);
+    }
+    if (queryParams.length > 0) {
+      executeUrl += `?${queryParams.join('&')}`;
+    }
+
+    try {
+      const resp = await fetch(executeUrl, { method: 'POST' });
+      if (!resp.ok) {
+        throw new Error(`Execution trigger failed with status ${resp.status}`);
+      }
+    } catch (e) {
+      showToast(`Execution Error: ${e.message}`, 'error');
+      setIsExecuting(false);
+    }
+  };
+
+  // Global Keyboard Shortcuts Listener
+  useEffect(() => {
+    const handleGlobalKeyDown = (e) => {
+      const tag = e.target.tagName?.toLowerCase();
+      const isInput = tag === 'input' || tag === 'textarea' || e.target.isContentEditable;
+
+      // ? or Shift + / -> Toggle Shortcuts Modal (when not inside an input)
+      if (e.key === '?' && !isInput) {
+        e.preventDefault();
+        setShowShortcutsModal((prev) => !prev);
+      }
+
+      // Ctrl + Enter or Cmd + Enter -> Run Test
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        triggerExecution();
+      }
+
+      // R -> Refresh devices (when not in input)
+      if ((e.key === 'r' || e.key === 'R') && !isInput && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        fetchDevicesList();
+        fetchDeviceInfo();
+        showToast('Refreshing devices & telemetry', 'info', 1500);
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [activeProject, selectedTest, selectedTests, selectedDevice, runTarget]);
+
   return (
     <ProjectContext.Provider
       value={{
@@ -310,6 +532,9 @@ export function ProjectProvider({ children }) {
         setOperatingMode,
         isExecuting,
         setIsExecuting,
+        triggerExecution,
+        elapsedSeconds,
+        formattedElapsedTime,
         deviceInfo,
         setDeviceInfo,
         fetchDeviceInfo,
@@ -325,9 +550,60 @@ export function ProjectProvider({ children }) {
         setExecutionStats,
         executionSession,
         setExecutionSession,
+        activeSessions,
+        toasts,
+        showToast,
+        removeToast,
+        notifications,
+        addNotification,
+        markAllNotificationsRead,
+        clearNotifications,
+        unreadNotificationsCount,
+        showShortcutsModal,
+        setShowShortcutsModal,
+        requestDesktopNotificationPermission,
       }}
     >
       {children}
+
+      {/* Keyboard Shortcuts Cheat Sheet Modal */}
+      <ShortcutsModal />
+
+      {/* Floating Toast Notification Container */}
+      <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2.5 max-w-sm w-full pointer-events-none">
+        {toasts.map((toast) => {
+          let bg = 'bg-slate-900 text-white border-slate-800';
+          let icon = <Info className="h-4 w-4 text-blue-400 shrink-0" />;
+          if (toast.type === 'success') {
+            bg = 'bg-emerald-950/90 text-emerald-100 border-emerald-800/80 shadow-emerald-900/20';
+            icon = <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />;
+          } else if (toast.type === 'error') {
+            bg = 'bg-rose-950/90 text-rose-100 border-rose-800/80 shadow-rose-900/20';
+            icon = <AlertCircle className="h-4 w-4 text-rose-400 shrink-0" />;
+          } else if (toast.type === 'warning') {
+            bg = 'bg-amber-950/90 text-amber-100 border-amber-800/80 shadow-amber-900/20';
+            icon = <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />;
+          }
+
+          return (
+            <div
+              key={toast.id}
+              className={`pointer-events-auto p-3.5 rounded-xl border shadow-lg backdrop-blur-md text-xs font-medium flex items-center justify-between gap-3 animate-in slide-in-from-bottom-2 fade-in duration-200 ${bg}`}
+            >
+              <div className="flex items-center gap-2.5 truncate">
+                {icon}
+                <span className="truncate">{toast.message}</span>
+              </div>
+              <button
+                onClick={() => removeToast(toast.id)}
+                className="p-1 rounded-md text-slate-400 hover:text-white transition cursor-pointer shrink-0"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
     </ProjectContext.Provider>
   );
 }

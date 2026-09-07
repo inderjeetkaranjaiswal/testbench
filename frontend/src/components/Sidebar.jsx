@@ -1,6 +1,29 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { Layers, Plus, FolderGit2, FlaskConical, FileCode2, ChevronRight, LayoutDashboard, FolderKanban, Terminal, Settings, RefreshCw, Box, Play, Cpu, GripVertical } from 'lucide-react';
+import {
+  Layers,
+  Plus,
+  FolderGit2,
+  FlaskConical,
+  FileCode2,
+  ChevronRight,
+  LayoutDashboard,
+  FolderKanban,
+  Terminal,
+  Settings,
+  RefreshCw,
+  Box,
+  Play,
+  Cpu,
+  GripVertical,
+  ChevronDown,
+  CheckSquare,
+  Square,
+  Search,
+  Copy,
+  Check,
+  X
+} from 'lucide-react';
 import { useProject } from '../context/ProjectContext.jsx';
 import BrandLogo from './BrandLogo.jsx';
 
@@ -11,6 +34,7 @@ export default function Sidebar() {
     selectedTest,
     setSelectedTest,
     selectedTests,
+    setSelectedTests,
     toggleTestSelection,
     selectAllTests,
     deselectAllTests,
@@ -20,12 +44,16 @@ export default function Sidebar() {
     loadingTests,
     fetchProjects,
     selectProject,
+    showToast,
   } = useProject();
+
+  const [testFilter, setTestFilter] = useState('');
+  const [copiedTarget, setCopiedTarget] = useState('');
 
   // Sidebar resizing state (min: 200px, max: 550px, default: 290px)
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const saved = localStorage.getItem('testbench_sidebar_width');
-    return saved ? parseInt(saved, 10) : 290;
+    return saved ? parseInt(saved, 10) : 310;
   });
   const [isResizing, setIsResizing] = useState(false);
 
@@ -70,18 +98,50 @@ export default function Sidebar() {
     fetchProjects();
   }, []);
 
-  const getFrameworkBadge = (framework) => {
-    switch (framework?.toLowerCase()) {
-      case 'maven':
-        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">Maven</span>;
-      case 'playwright':
-        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200">Playwright</span>;
-      case 'javascript':
-        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">JS</span>;
-      default:
-        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">App</span>;
+  const getFrameworkBadge = (framework, language) => {
+    const fw = framework?.toLowerCase();
+    const lang = language?.toLowerCase();
+
+    let fwBadge = null;
+    if (fw === 'appium') {
+      fwBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 uppercase">Appium</span>;
+    } else if (fw === 'selenium') {
+      fwBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase">Selenium</span>;
+    } else if (fw === 'playwright') {
+      fwBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-sky-50 text-sky-700 border border-sky-200 uppercase">Playwright</span>;
+    } else {
+      fwBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-100 text-slate-700 border border-slate-200 uppercase">{framework || 'Generic'}</span>;
     }
+
+    let langBadge = null;
+    if (lang === 'java') {
+      langBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-200">Java</span>;
+    } else if (lang === 'python') {
+      langBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-50 text-blue-700 border border-blue-200">Python</span>;
+    } else if (lang === 'typescript') {
+      langBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-teal-50 text-teal-700 border border-teal-200">TS</span>;
+    } else if (lang === 'javascript') {
+      langBadge = <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-yellow-50 text-yellow-800 border border-yellow-200">JS</span>;
+    }
+
+    return (
+      <div className="flex items-center gap-1">
+        {fwBadge}
+        {langBadge}
+      </div>
+    );
   };
+
+  // Get active tests: prefer individual discovered tests, fallback to test files
+  const activeTestItems = activeProject?.tests && activeProject.tests.length > 0
+    ? activeProject.tests
+    : (activeProject?.test_files || []).map((f) => ({
+        id: f,
+        name: f.split('/').pop(),
+        display_name: f.split('/').pop(),
+        file: f,
+        execution_target: f
+      }));
 
   return (
     <aside
@@ -168,9 +228,9 @@ export default function Sidebar() {
                           </span>
                         </div>
                         <div className="flex items-center gap-2 mt-1.5">
-                          {getFrameworkBadge(project.framework_type)}
+                          {getFrameworkBadge(project.framework || project.framework_type, project.language)}
                           <span className="text-[10px] text-text-secondary font-mono">
-                            {project.test_count ?? 0} tests
+                            {project.test_count ?? (project.tests?.length || project.test_files?.length || 0)} tests
                           </span>
                         </div>
                       </div>
@@ -182,11 +242,11 @@ export default function Sidebar() {
             )}
           </div>
 
-          {/* SECTION 2: Application Tests */}
+          {/* SECTION 2: Discovered Tests */}
           <div className="space-y-3 pt-4 border-t border-slate-100">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-bold text-text-secondary uppercase tracking-wider flex items-center gap-1.5">
-                <FlaskConical className="h-3.5 w-3.5 text-brand" /> Application Tests
+                <FlaskConical className="h-3.5 w-3.5 text-brand" /> Discovered Tests
               </span>
               {activeProject && (
                 <span className="text-[10px] px-2 py-0.5 rounded bg-slate-100 border border-custom-border text-text-primary font-mono truncate max-w-[110px]">
@@ -200,42 +260,78 @@ export default function Sidebar() {
               <div className="p-6 text-center border border-dashed border-custom-border rounded-custom bg-slate-50/50">
                 <FileCode2 className="h-7 w-7 text-slate-400 mx-auto mb-2" />
                 <p className="text-xs text-text-secondary font-medium leading-relaxed">
-                  Select an application above to view tests
+                  Select an application above to view discovered tests
                 </p>
               </div>
             ) : loadingTests ? (
               <div className="text-[11px] text-text-secondary py-4 text-center flex items-center justify-center gap-2">
-                <RefreshCw className="h-3.5 w-3.5 animate-spin text-brand" /> Fetching test files...
+                <RefreshCw className="h-3.5 w-3.5 animate-spin text-brand" /> Scanning tests...
               </div>
-            ) : !activeProject.test_files || activeProject.test_files.length === 0 ? (
+            ) : activeTestItems.length === 0 ? (
               <div className="p-4 text-center border border-custom-border rounded-custom bg-slate-50">
-                <p className="text-xs font-semibold text-text-primary">No test files detected</p>
-                <p className="text-[10px] text-text-secondary mt-0.5">Scanned for *Test.java, *.spec.ts, *.test.ts</p>
+                <p className="text-xs font-semibold text-text-primary">No tests detected</p>
+                <p className="text-[10px] text-text-secondary mt-0.5">Scanned for TestNG, JUnit, pytest, Playwright</p>
               </div>
             ) : (
               <div className="space-y-2">
+                {/* Search Filter inside Test Tree */}
+                {activeTestItems.length > 5 && (
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
+                    <input
+                      type="text"
+                      value={testFilter}
+                      onChange={(e) => setTestFilter(e.target.value)}
+                      placeholder="Filter test methods..."
+                      className="w-full pl-7 pr-6 py-1 bg-slate-50 border border-slate-200 rounded-md text-[11px] text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-600 font-mono"
+                    />
+                    {testFilter && (
+                      <button
+                        onClick={() => setTestFilter('')}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Select All & Action Buttons Header */}
-                <div className="flex items-center justify-between pt-1 pb-1 px-1">
-                  <div className="flex items-center gap-2">
+                <div className="flex items-center justify-between pt-0.5 pb-1 px-1">
+                  <div className="flex items-center gap-1.5 text-[10px]">
                     <button
                       id="btn-select-all-tests"
                       onClick={() => {
-                        if (selectedTests.length === activeProject.test_files.length) {
+                        const allTargets = activeTestItems.map((t) => t.execution_target || t.id);
+                        if (selectedTests.length === allTargets.length) {
                           deselectAllTests();
                         } else {
-                          selectAllTests();
+                          selectAllTests(allTargets);
                         }
                       }}
-                      className="text-[10px] font-bold text-brand hover:underline cursor-pointer"
+                      className="font-bold text-brand hover:underline cursor-pointer"
                     >
-                      {selectedTests.length === activeProject.test_files.length ? 'Deselect All' : 'Select All'}
+                      {selectedTests.length === activeTestItems.length ? 'Clear' : 'All'}
                     </button>
-                    <span className="text-[10px] text-text-secondary font-mono">
-                      ({selectedTests.length}/{activeProject.test_files.length})
+                    <span className="text-slate-300">|</span>
+                    <button
+                      onClick={() => {
+                        const allTargets = activeTestItems.map((t) => t.execution_target || t.id);
+                        const inverted = allTargets.filter((t) => !selectedTests.includes(t));
+                        setSelectedTests(inverted);
+                        setRunTarget(inverted.length === 0 ? 'all' : 'selected');
+                      }}
+                      className="text-slate-500 hover:text-slate-800 cursor-pointer"
+                      title="Invert current test selection"
+                    >
+                      Invert
+                    </button>
+                    <span className="text-text-secondary font-mono text-[9px] ml-0.5">
+                      ({selectedTests.length}/{activeTestItems.length})
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex items-center gap-1">
                     <button
                       id="btn-run-selected-tests"
                       onClick={() => {
@@ -248,7 +344,7 @@ export default function Sidebar() {
                       className="px-2 py-0.5 rounded text-[10px] font-bold bg-brand text-white hover:bg-brand-hover disabled:opacity-30 disabled:hover:bg-brand transition cursor-pointer"
                       title="Run only selected tests"
                     >
-                      Run Selected
+                      Run ({selectedTests.length})
                     </button>
                     <button
                       id="btn-run-all-tests"
@@ -262,101 +358,108 @@ export default function Sidebar() {
                       className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-white hover:bg-slate-900 transition cursor-pointer"
                       title="Run all project tests"
                     >
-                      Run All
+                      All
                     </button>
                   </div>
                 </div>
 
-                {/* Discovered Test Files List */}
+                {/* Discovered Tests List */}
                 <div className="space-y-1 max-h-56 overflow-y-auto pr-0.5">
-                  {activeProject.test_files.map((testPath, idx) => {
-                    const fileName = testPath.split('/').pop();
-                    const isChecked = selectedTests.includes(testPath);
-                    const isTestSelected = selectedTest === testPath;
+                  {activeTestItems
+                    .filter((t) => {
+                      const q = testFilter.toLowerCase().trim();
+                      if (!q) return true;
+                      return (
+                        (t.display_name || '').toLowerCase().includes(q) ||
+                        (t.name || '').toLowerCase().includes(q) ||
+                        (t.class_name || '').toLowerCase().includes(q) ||
+                        (t.file || '').toLowerCase().includes(q)
+                      );
+                    })
+                    .map((testItem, idx) => {
+                      const targetKey = testItem.execution_target || testItem.id;
+                      const isChecked = selectedTests.includes(targetKey);
+                      const isTestSelected = selectedTest === targetKey;
+                      const displayName = testItem.display_name || testItem.name;
+                      const isCopied = copiedTarget === targetKey;
 
-                    return (
-                      <div
-                        key={idx}
-                        id={`test-file-item-${idx}`}
-                        className={`px-2.5 py-2 rounded-custom border text-xs transition-all flex items-center justify-between select-none ${
-                          isChecked || isTestSelected
-                            ? 'bg-brand/10 border-brand/20 text-brand font-semibold'
-                            : 'bg-transparent border-transparent hover:bg-slate-50 text-text-secondary hover:text-text-primary'
-                        }`}
-                        title={testPath}
-                      >
-                        <div className="flex items-center gap-2 min-w-0 flex-1">
-                          <input
-                            type="checkbox"
-                            checked={isChecked}
-                            onChange={() => toggleTestSelection(testPath)}
-                            className="rounded border-slate-300 text-brand focus:ring-brand cursor-pointer shrink-0"
-                          />
-                          <div
-                            onClick={() => {
-                              setSelectedTest(testPath);
-                              toggleTestSelection(testPath);
-                              if (window.location.pathname !== '/dashboard') {
-                                navigate('/dashboard');
-                              }
-                            }}
-                            className="min-w-0 flex-1 cursor-pointer"
-                          >
-                            <p className={`truncate text-[12px] ${isChecked || isTestSelected ? 'text-brand font-semibold' : 'text-text-primary'}`}>{fileName}</p>
-                            <p className="text-[9px] text-text-secondary font-mono truncate">{testPath}</p>
-                          </div>
-                        </div>
-                        <button
-                          onClick={() => {
-                            setSelectedTest(testPath);
-                            if (!selectedTests.includes(testPath)) {
-                              toggleTestSelection(testPath);
-                            }
-                            if (window.location.pathname !== '/dashboard') {
-                              navigate('/dashboard');
-                            }
-                          }}
-                          className={`p-1 rounded text-[10px] transition ${
-                            isChecked ? 'bg-brand/20 text-brand' : 'text-slate-400 hover:text-slate-600'
+                      return (
+                        <div
+                          key={idx}
+                          id={`test-file-item-${idx}`}
+                          className={`group px-2.5 py-1.5 rounded-custom border text-xs transition-all flex items-center justify-between select-none ${
+                            isChecked || isTestSelected
+                              ? 'bg-brand/10 border-brand/20 text-brand font-semibold'
+                              : 'bg-transparent border-transparent hover:bg-slate-50 text-text-secondary hover:text-text-primary'
                           }`}
-                          title="Run single test"
+                          title={targetKey}
                         >
-                          <Play className="h-3 w-3 fill-current" />
-                        </button>
-                      </div>
-                    );
-                  })}
+                          <div className="flex items-center gap-2 min-w-0 flex-1">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleTestSelection(targetKey)}
+                              className="rounded border-slate-300 text-brand focus:ring-brand cursor-pointer shrink-0"
+                            />
+                            <div
+                              onClick={() => {
+                                setSelectedTest(targetKey);
+                                toggleTestSelection(targetKey);
+                                if (window.location.pathname !== '/dashboard') {
+                                  navigate('/dashboard');
+                                }
+                              }}
+                              className="min-w-0 flex-1 cursor-pointer"
+                            >
+                              <p className={`truncate text-[11px] ${isChecked || isTestSelected ? 'text-brand font-semibold' : 'text-text-primary'}`}>
+                                {displayName}
+                              </p>
+                              <p className="text-[9px] text-text-secondary font-mono truncate">
+                                {testItem.class_name ? `${testItem.class_name} • ` : ''}{testItem.file}
+                              </p>
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              navigator.clipboard.writeText(targetKey);
+                              setCopiedTarget(targetKey);
+                              setTimeout(() => setCopiedTarget(''), 2000);
+                              showToast(`Copied test target: ${displayName}`, 'info', 1500);
+                            }}
+                            className="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-slate-700 transition cursor-pointer shrink-0 ml-1"
+                            title="Copy Test Target Path"
+                          >
+                            {isCopied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+                          </button>
+                        </div>
+                      );
+                    })}
                 </div>
               </div>
             )}
           </div>
         </div>
 
-        {/* Footer Status Bar */}
-        <div className="p-4 border-t border-slate-100 flex items-center justify-between text-xs text-text-secondary bg-white shrink-0">
-          <div className="flex items-center gap-2 select-none">
-            <div className="w-2.5 h-2.5 rounded-full bg-success animate-pulse"></div>
-            <span>Platform Status: Live</span>
+        {/* Footer Area */}
+        <div className="p-4 border-t border-custom-border bg-slate-50/50 shrink-0">
+          <div className="flex items-center justify-between text-xs text-text-secondary">
+            <span className="font-mono text-[10px]">TestBench v1.0.0</span>
+            <span className="flex items-center gap-1.5 text-[10px] font-semibold text-emerald-600">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              Ready
+            </span>
           </div>
-          <span>v1.0.0</span>
         </div>
       </div>
 
-      {/* Resize Handle Handle on Right Border */}
+      {/* Resize Handle */}
       <div
-        id="sidebar-resize-handle"
         onMouseDown={startResizing}
-        className={`absolute top-0 right-0 w-2 h-full cursor-col-resize transition-all z-40 flex items-center justify-center hover:bg-blue-500/20 group/handle ${
-          isResizing ? 'bg-blue-500/30' : 'bg-transparent'
-        }`}
+        className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-brand/40 active:bg-brand transition-colors z-40"
         title="Drag to resize sidebar"
-      >
-        <div
-          className={`w-1 h-12 rounded-full transition-colors ${
-            isResizing ? 'bg-blue-600' : 'bg-slate-300 group-hover/handle:bg-blue-500'
-          }`}
-        />
-      </div>
+      />
     </aside>
   );
 }

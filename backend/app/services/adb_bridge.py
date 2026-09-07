@@ -4,112 +4,90 @@ import gzip
 import io
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from PIL import Image
 from fastapi import WebSocket, WebSocketDisconnect
 
-# Global cached state for ADB streaming
+from app.config import (
+    find_adb as _find_adb_cfg,
+    find_emulator as _find_emu_cfg,
+    find_ffmpeg as _find_ffmpeg_cfg,
+    find_scrcpy_server_jar as _find_scrcpy_cfg,
+    get_workspace_dir
+)
+
+# Cached binaries
 _cached_adb_path: Optional[str] = None
 _cached_device_id: Optional[str] = None
-_latest_frame_url: Optional[str] = None
-_current_frame_id: int = 0
-_last_frame_timestamp: float = time.time()
-_is_worker_running: bool = False
-_active_connections: int = 0
+_cached_ffmpeg_path: Optional[str] = None
+_cached_scrcpy_jar_path: Optional[str] = None
+_pushed_scrcpy_devices: set = set()
 
 
 def find_adb_executable() -> Optional[str]:
     """
-    Locates the adb executable in PATH or fallback Android SDK / project platform-tools directories across macOS, Linux, and Windows.
-    Caches result for ultra-fast repeated access.
+    Locates the adb executable via centralized configuration and discovery.
     """
-    global _cached_adb_path
-    if _cached_adb_path and Path(_cached_adb_path).exists():
-        return _cached_adb_path
-
-    adb_in_path = shutil.which("adb") or shutil.which("adb.exe")
-    if adb_in_path:
-        _cached_adb_path = adb_in_path
-        return adb_in_path
-
-    home = Path.home()
-    known_paths = [
-        # macOS / Linux standard locations
-        Path("/opt/homebrew/bin/adb"),
-        Path("/usr/local/bin/adb"),
-        home / "Library/Android/sdk/platform-tools/adb",
-        home / "Android/Sdk/platform-tools/adb",
-        # Windows standard locations
-        home / "AppData/Local/Android/Sdk/platform-tools/adb.exe",
-        home / "AppData/Local/Android/sdk/platform-tools/adb.exe",
-        Path(r"C:\Android\platform-tools\adb.exe"),
-        Path(r"C:\platform-tools\adb.exe"),
-    ]
-    for p in known_paths:
-        if p.exists():
-            _cached_adb_path = str(p)
-            return _cached_adb_path
-
-    # Search current project workspace directory
-    base_dir = Path(__file__).resolve().parent.parent.parent.parent
-    for p in [base_dir / "workspace", base_dir]:
-        if p.exists():
-            try:
-                for match in p.rglob("adb*"):
-                    if match.name in ("adb", "adb.exe") and match.is_file():
-                        _cached_adb_path = str(match)
-                        return _cached_adb_path
-            except Exception:
-                pass
-
-    return None
-
-
-_cached_emulator_path: Optional[str] = None
+    return _find_adb_cfg()
 
 
 def find_emulator_executable() -> Optional[str]:
     """
-    Locates the Android emulator binary executable in PATH or Android SDK directories.
-    Caches result for fast repeated access.
+    Locates the Android emulator executable via centralized configuration and discovery.
     """
-    global _cached_emulator_path
-    if _cached_emulator_path and Path(_cached_emulator_path).exists():
-        return _cached_emulator_path
+    return _find_emu_cfg()
 
-    emu_in_path = shutil.which("emulator") or shutil.which("emulator.exe")
-    if emu_in_path:
-        _cached_emulator_path = emu_in_path
-        return emu_in_path
 
-    home = Path.home()
-    known_paths = [
-        home / "Library/Android/sdk/emulator/emulator",
-        home / "Android/Sdk/emulator/emulator",
-        home / "AppData/Local/Android/Sdk/emulator/emulator.exe",
-        home / "AppData/Local/Android/sdk/emulator/emulator.exe",
-        Path(r"C:\Android\emulator\emulator.exe"),
-        Path(r"C:\Android\Sdk\emulator\emulator.exe"),
-        Path("/opt/homebrew/bin/emulator"),
-        Path("/usr/local/bin/emulator"),
-    ]
-    for p in known_paths:
-        if p.exists():
-            _cached_emulator_path = str(p)
-            return _cached_emulator_path
+def find_ffmpeg_executable() -> Optional[str]:
+    """
+    Locates the ffmpeg executable via centralized configuration and discovery.
+    """
+    return _find_ffmpeg_cfg()
 
-    adb_p = find_adb_executable()
-    if adb_p:
-        sdk_dir = Path(adb_p).parent.parent
-        emu_candidate = sdk_dir / "emulator" / ("emulator.exe" if os.name == 'nt' else "emulator")
-        if emu_candidate.exists():
-            _cached_emulator_path = str(emu_candidate)
-            return _cached_emulator_path
 
-    return None
+def find_scrcpy_server_jar() -> Optional[str]:
+    """
+    Locates scrcpy-server.jar via centralized configuration and discovery.
+    """
+    return _find_scrcpy_cfg()
+
+
+def find_free_tcp_port(start_port: int = 27183) -> int:
+    """Finds an available local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+async def push_scrcpy_server_if_needed(adb_path: str, device_id: str) -> bool:
+    """Pushes scrcpy-server.jar to /data/local/tmp/scrcpy-server.jar on device if not already present."""
+    global _pushed_scrcpy_devices
+    jar_path = find_scrcpy_server_jar()
+    if not jar_path:
+        return False
+
+    if device_id in _pushed_scrcpy_devices:
+        return True
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            adb_path, "-s", device_id, "push", jar_path, "/data/local/tmp/scrcpy-server.jar",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=creation_flags
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+        if proc.returncode == 0:
+            _pushed_scrcpy_devices.add(device_id)
+            return True
+    except Exception as e:
+        print(f"[SCRCPY PUSH ERROR] {e}")
+    return False
 
 
 _last_device_check: float = 0.0
@@ -118,33 +96,11 @@ _last_device_check: float = 0.0
 async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False, target_device_id: Optional[str] = None) -> Optional[str]:
     """
     Asynchronously runs `adb devices` without blocking the asyncio threadpool.
-    Returns serial of target_device_id if specified and active, or the first active online 'device'.
+    Returns serial of target_device_id if specified (matching ADB serial or AVD name), or the first active online 'device'.
     """
     global _cached_device_id, _last_device_check
-    now = time.time()
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
-    if target_device_id and not force_refresh:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                adb_path, "devices",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creation_flags
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-            out_text = stdout.decode(errors="ignore")
-            for line in out_text.splitlines():
-                if target_device_id in line and "\tdevice" in line:
-                    _cached_device_id = target_device_id
-                    return target_device_id
-        except Exception:
-            pass
-
-    if not force_refresh and _cached_device_id and (now - _last_device_check < 4.0):
-        return _cached_device_id
-
-    _last_device_check = now
     try:
         proc = await asyncio.create_subprocess_exec(
             adb_path, "devices",
@@ -155,56 +111,62 @@ async def get_online_adb_device_async(adb_path: str, force_refresh: bool = False
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.5)
         out_text = stdout.decode(errors="ignore")
 
+        active_ids = []
         if proc.returncode == 0 and out_text:
-            lines = out_text.splitlines()
+            for line in out_text.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[1] == "device":
+                    active_ids.append(parts[0])
 
-            # Disconnect stale offline devices
-            for line in lines:
-                line = line.strip()
-                if line and not line.startswith("List of"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].strip() == "offline":
-                        device_address = parts[0].strip()
-                        if ":" in device_address:
-                            try:
-                                proc_disc = await asyncio.create_subprocess_exec(
-                                    adb_path, "disconnect", device_address, creationflags=creation_flags
-                                )
-                                await asyncio.wait_for(proc_disc.communicate(), timeout=1.5)
-                            except Exception:
-                                pass
+        if not active_ids:
+            _cached_device_id = None
+            return None
 
-            # Re-fetch active devices
-            proc2 = await asyncio.create_subprocess_exec(
-                adb_path, "devices",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creation_flags
-            )
-            stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=2.5)
-            out_text2 = stdout2.decode(errors="ignore")
+        # 1. Direct match on ADB serial (e.g. emulator-5554 or physical serial)
+        if target_device_id and target_device_id in active_ids:
+            _cached_device_id = target_device_id
+            return target_device_id
 
-            if proc2.returncode == 0 and out_text2:
-                active_ids = []
-                for line in out_text2.splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("List of"):
-                        parts = line.split()
-                        if len(parts) >= 2 and parts[1].strip() == "device":
-                            dev_id = parts[0].strip()
-                            active_ids.append(dev_id)
-                            if target_device_id and dev_id == target_device_id:
-                                _cached_device_id = dev_id
-                                return dev_id
+        # 2. Check if target_device_id matches an AVD name of any running emulator
+        if target_device_id:
+            target_norm = target_device_id.lower().replace(" ", "_")
+            for dev_id in active_ids:
+                if dev_id.startswith("emulator-"):
+                    try:
+                        out_avd = await asyncio.to_thread(_exec_cmd_sync, [adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.qemu.avd_name"], 2.0, creation_flags)
+                        avd = out_avd.strip()
+                        if not avd:
+                            out_avd = await asyncio.to_thread(_exec_cmd_sync, [adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.avd_name"], 2.0, creation_flags)
+                            avd = out_avd.strip()
+                        if avd and (avd == target_device_id or avd.lower().replace(" ", "_") == target_norm):
+                            _cached_device_id = dev_id
+                            return dev_id
+                    except Exception:
+                        pass
 
-                if active_ids:
-                    _cached_device_id = active_ids[0]
-                    return _cached_device_id
+        # 3. Fallback to the first active running device
+        _cached_device_id = active_ids[0]
+        return active_ids[0]
+
     except Exception as e:
         print(f"[ADB Devices Warning] {e}")
 
     _cached_device_id = None
     return None
+
+
+def _exec_cmd_sync(cmd: list, timeout: float = 3.0, creation_flags: int = 0) -> str:
+    try:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            creationflags=creation_flags
+        )
+        return res.stdout.decode(errors="ignore")
+    except Exception:
+        return ""
 
 
 async def list_all_devices_and_emulators_async() -> dict:
@@ -214,27 +176,20 @@ async def list_all_devices_and_emulators_async() -> dict:
     Returns categorized real_devices and emulators with current operational status.
     """
     adb_path = find_adb_executable()
+    emu_path = find_emulator_executable()
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
     running_devices = {}
     if adb_path:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                adb_path, "devices", "-l",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creation_flags
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-            out_text = stdout.decode(errors="ignore")
-
+            out_text = await asyncio.to_thread(_exec_cmd_sync, [adb_path, "devices", "-l"], 3.0, creation_flags)
             for line in out_text.splitlines():
                 line = line.strip()
-                if line and not line.startswith("List of") and "\t" in line:
-                    parts = line.split("\t")
-                    if len(parts) >= 2 and parts[1].strip().startswith("device"):
+                if line and not line.startswith("List of"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].startswith("device"):
                         dev_id = parts[0].strip()
-                        extra_info = parts[1].strip()
+                        extra_info = " ".join(parts[2:]) if len(parts) > 2 else parts[1]
                         model_name = dev_id
                         if "model:" in extra_info:
                             model_name = extra_info.split("model:")[-1].split()[0].replace("_", " ")
@@ -247,44 +202,35 @@ async def list_all_devices_and_emulators_async() -> dict:
                             "model": model_name
                         }
         except Exception as e:
-            print(f"[ADB Devices List Error] {e}")
+            print(f"[ADB Devices List Error] {repr(e)}")
 
     # Query running emulator AVD names via adb shell
     running_avd_map = {}
     for dev_id in list(running_devices.keys()):
         if dev_id.startswith("emulator-"):
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.qemu.avd_name",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=creation_flags
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-                avd_name = stdout.decode(errors="ignore").strip()
+                out_avd = await asyncio.to_thread(_exec_cmd_sync, [adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.qemu.avd_name"], 2.0, creation_flags)
+                avd_name = out_avd.strip()
+                if not avd_name:
+                    out_avd = await asyncio.to_thread(_exec_cmd_sync, [adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.avd_name"], 2.0, creation_flags)
+                    avd_name = out_avd.strip()
                 if avd_name:
                     running_avd_map[avd_name] = dev_id
+                    running_avd_map[avd_name.lower().replace(" ", "_")] = dev_id
             except Exception:
                 pass
 
     # Discover all AVDs from emulator binary
-    emu_path = find_emulator_executable()
     avds_found = []
     if emu_path:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                emu_path, "-list-avds",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creation_flags
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-            for line in stdout.decode(errors="ignore").splitlines():
+            out_emu = await asyncio.to_thread(_exec_cmd_sync, [emu_path, "-list-avds"], 3.0, creation_flags)
+            for line in out_emu.splitlines():
                 avd = line.strip()
                 if avd:
                     avds_found.append(avd)
         except Exception as e:
-            print(f"[Emulator List AVDs Error] {e}")
+            print(f"[Emulator List AVDs Error] {repr(e)}")
 
     # Separate physical devices vs emulators
     real_devices = []
@@ -303,11 +249,12 @@ async def list_all_devices_and_emulators_async() -> dict:
 
     for avd in avds_found:
         display_name = avd.replace("_", " ")
-        if avd in running_avd_map:
-            running_id = running_avd_map[avd]
-            seen_running_emulators.add(running_id)
+        avd_norm = avd.lower().replace(" ", "_")
+        matched_id = running_avd_map.get(avd) or running_avd_map.get(avd_norm)
+        if matched_id:
+            seen_running_emulators.add(matched_id)
             emulators.append({
-                "id": running_id,
+                "id": matched_id,
                 "name": display_name,
                 "avd_name": avd,
                 "status": "running",
@@ -449,6 +396,103 @@ async def start_emulator_async(avd_name: str) -> dict:
         return {
             "status": "success",
             "message": f"Emulator '{avd_name}' launched ({assigned_id}). Finishing background boot...",
+            "device_id": assigned_id,
+            "avd_name": avd_name,
+            "boot_status": "booting"
+        }
+
+    return {"status": "error", "message": f"Timed out waiting for emulator '{avd_name}' to register via ADB."}
+
+
+def start_emulator_sync(avd_name: str, log_file=None) -> dict:
+    """
+    Synchronously launches an Android Virtual Device image as a background process
+    and polls for boot completion (sys.boot_completed==1 and init.svc.bootanim==stopped).
+    """
+    global _active_emulator_processes
+    emu_path = find_emulator_executable()
+    if not emu_path:
+        return {"status": "error", "message": "Android Studio Emulator executable not found in PATH or Android SDK."}
+
+    adb_path = find_adb_executable()
+    if not adb_path:
+        return {"status": "error", "message": "ADB executable not found."}
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    existing_proc = _active_emulator_processes.get(avd_name)
+    if not (existing_proc and existing_proc.poll() is None):
+        try:
+            env = os.environ.copy()
+            sdk_dir = Path(emu_path).parent.parent
+            if "ANDROID_HOME" not in env:
+                env["ANDROID_HOME"] = str(sdk_dir)
+            if "ANDROID_SDK_ROOT" not in env:
+                env["ANDROID_SDK_ROOT"] = str(sdk_dir)
+
+            pop_kwargs = {"env": env}
+            if os.name == 'nt':
+                pop_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+            else:
+                pop_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(
+                [emu_path, "-avd", avd_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                **pop_kwargs
+            )
+            _active_emulator_processes[avd_name] = proc
+            msg = f"[EMULATOR] Launched emulator process for '{avd_name}' (PID: {proc.pid})"
+            if log_file:
+                log_file.write(f"{msg}\n")
+                log_file.flush()
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to launch emulator process for '{avd_name}': {str(e)}"}
+
+    assigned_id = None
+    for _ in range(60):
+        time.sleep(1.0)
+        res = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=2.0, creationflags=creation_flags)
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("emulator-") and "device" in line:
+                    dev_id = line.split()[0]
+                    res_avd = subprocess.run([adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.qemu.avd_name"], capture_output=True, text=True, timeout=2.0, creationflags=creation_flags)
+                    avd_found = res_avd.stdout.strip()
+                    if not avd_found:
+                        res_avd = subprocess.run([adb_path, "-s", dev_id, "shell", "getprop", "ro.boot.avd_name"], capture_output=True, text=True, timeout=2.0, creationflags=creation_flags)
+                        avd_found = res_avd.stdout.strip()
+                    if avd_found == avd_name or not avd_found:
+                        assigned_id = dev_id
+                        break
+
+        if assigned_id:
+            res_boot = subprocess.run([adb_path, "-s", assigned_id, "shell", "getprop", "sys.boot_completed"], capture_output=True, text=True, timeout=2.0, creationflags=creation_flags)
+            res_anim = subprocess.run([adb_path, "-s", assigned_id, "shell", "getprop", "init.svc.bootanim"], capture_output=True, text=True, timeout=2.0, creationflags=creation_flags)
+            if res_boot.stdout.strip() == "1" and res_anim.stdout.strip() == "stopped":
+                try:
+                    subprocess.run([adb_path, "-s", assigned_id, "shell", "input keyevent 224 && input keyevent 82 && wm dismiss-keyguard"], capture_output=True, timeout=3.0, creationflags=creation_flags)
+                except Exception:
+                    pass
+                succ_msg = f"[EMULATOR SUCCESS] Emulator '{avd_name}' is fully booted and online ({assigned_id})."
+                if log_file:
+                    log_file.write(f"{succ_msg}\n")
+                    log_file.flush()
+                return {
+                    "status": "success",
+                    "message": succ_msg,
+                    "device_id": assigned_id,
+                    "avd_name": avd_name,
+                    "boot_status": "ready"
+                }
+
+    if assigned_id:
+        return {
+            "status": "success",
+            "message": f"Emulator '{avd_name}' online ({assigned_id}). Finishing boot...",
             "device_id": assigned_id,
             "avd_name": avd_name,
             "boot_status": "booting"
@@ -625,55 +669,206 @@ async def capture_and_compress_frame_async(adb_path: str, device_id: Optional[st
         return None
 
 
-async def _background_frame_worker():
-    """
-    Background worker loop capturing screen frames asynchronously as fast as device allows
-    and updating global _latest_frame_url. Supports 25-30 FPS stream rates.
-    Includes full exception recovery to prevent thread termination.
-    """
-    global _is_worker_running, _latest_frame_url, _current_frame_id, _last_frame_timestamp
+# ==============================================================================
+# REAL-TIME VIDEO STREAMING (SCRCPY-SERVER + FFMPEG & SCREENSHOT FALLBACK)
+# ==============================================================================
 
-    if _is_worker_running:
-        return
-    _is_worker_running = True
+# STREAMING FORMAT TRADEOFF NOTE:
+# We implement high-throughput MJPEG transcoding over WebSocket & HTTP streaming because:
+# 1. Ultra-Low End-to-End Latency: MJPEG pipeline achieves <40ms latency without MP4 container muxing delays or MSE buffer starvation.
+# 2. Browser Simplicity & Compatibility: Works seamlessly across modern browsers in standard <img> tags and canvas without requiring complex MSE MediaSource JS state machines.
+# 3. Interactive Touch Precision: Frame presentation timestamps stay strictly real-time so user clicks/gestures align with the device display.
+# (Tradeoff: MJPEG requires more network bandwidth per second than fragmented MP4 (fMP4), but for local & testbench environments, minimal latency is the priority.)
+
+async def stream_scrcpy_video_frames(websocket: WebSocket, fps: int = 30, target_device_id: Optional[str] = None):
+    """
+    Spawns on-device scrcpy-server.jar H.264 video stream, forwards it over local TCP socket,
+    pipes the stream through ffmpeg to transcode into low-latency JPEG frames, and pushes
+    them over WebSocket in real-time.
+    Cleanly terminates subprocesses and socket forwarding on WebSocket disconnection.
+    """
+    adb_path = find_adb_executable()
+    if not adb_path:
+        raise RuntimeError("ADB executable not found.")
+
+    device_id = await get_online_adb_device_async(adb_path, target_device_id=target_device_id)
+    if not device_id:
+        raise RuntimeError("Target device not online.")
+
+    pushed = await push_scrcpy_server_if_needed(adb_path, device_id)
+    if not pushed:
+        raise RuntimeError("Failed to push scrcpy-server.jar to device.")
+
+    ffmpeg_bin = find_ffmpeg_executable()
+    if not ffmpeg_bin:
+        raise RuntimeError("FFmpeg binary not found.")
+
+    local_port = find_free_tcp_port()
+    scid = f"{local_port:08x}"
+    socket_name = f"scrcpy_{scid}"
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
+    proc_fwd = await asyncio.create_subprocess_exec(
+        adb_path, "-s", device_id, "forward", f"tcp:{local_port}", f"localabstract:{socket_name}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=creation_flags
+    )
+    await proc_fwd.wait()
+
+    scrcpy_proc = None
+    ffmpeg_proc = None
+    client_reader = None
+    client_writer = None
 
     try:
-        consecutive_failures = 0
-        while _active_connections > 0:
+        scrcpy_cmd = [
+            adb_path, "-s", device_id, "shell",
+            f"CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 2.4 "
+            f"scid={scid} tunnel_forward=true max_fps={fps} video_bit_rate=4000000 "
+            f"control=false audio=false cleanup=false send_device_meta=false"
+        ]
+        scrcpy_proc = await asyncio.create_subprocess_exec(
+            *scrcpy_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=creation_flags
+        )
+
+        connected = False
+        for _ in range(25):
+            await asyncio.sleep(0.1)
             try:
-                adb_path = find_adb_executable()
-                if not adb_path:
-                    await asyncio.sleep(1.0)
-                    continue
+                client_reader, client_writer = await asyncio.open_connection("127.0.0.1", local_port)
+                connected = True
+                break
+            except Exception:
+                pass
 
-                device_id = await get_online_adb_device_async(adb_path, force_refresh=(consecutive_failures > 3))
-                if not device_id:
-                    consecutive_failures += 1
-                    await asyncio.sleep(1.0)
-                    continue
+        if not connected or not client_reader:
+            raise RuntimeError(f"Could not connect to scrcpy socket on port {local_port}")
 
-                frame_url = await capture_and_compress_frame_async(adb_path, device_id)
-                if frame_url:
-                    _latest_frame_url = frame_url
-                    _current_frame_id += 1
-                    _last_frame_timestamp = time.time()
-                    consecutive_failures = 0
-                    await asyncio.sleep(0.01)  # Yield briefly for event loop (~30 FPS)
-                else:
-                    consecutive_failures += 1
-                    await asyncio.sleep(0.1)
-            except Exception as loop_err:
-                consecutive_failures += 1
-                print(f"[Frame Worker Loop Error] {loop_err}")
-                await asyncio.sleep(0.5)
+        ffmpeg_cmd = [
+            ffmpeg_bin,
+            "-f", "h264",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-i", "pipe:0",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-q:v", "3",
+            "-r", str(fps),
+            "pipe:1"
+        ]
+        ffmpeg_proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=creation_flags
+        )
+
+        async def socket_to_ffmpeg():
+            try:
+                dummy = await client_reader.read(1)
+                codec_hdr = await client_reader.read(12)
+
+                while True:
+                    hdr = await client_reader.readexactly(12)
+                    packet_size = int.from_bytes(hdr[8:12], byteorder="big")
+                    if packet_size > 0:
+                        packet_data = await client_reader.readexactly(packet_size)
+                        if ffmpeg_proc and ffmpeg_proc.stdin:
+                            ffmpeg_proc.stdin.write(packet_data)
+                            await ffmpeg_proc.stdin.drain()
+            except Exception:
+                pass
+            finally:
+                if ffmpeg_proc and ffmpeg_proc.stdin and not ffmpeg_proc.stdin.is_closing():
+                    try:
+                        ffmpeg_proc.stdin.close()
+                    except Exception:
+                        pass
+
+        async def ffmpeg_to_websocket():
+            buffer = bytearray()
+            SOI = b'\xff\xd8'
+            EOI = b'\xff\xd9'
+            target_interval = 1.0 / max(1, min(fps, 60))
+
+            while True:
+                chunk = await ffmpeg_proc.stdout.read(16384)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+
+                while True:
+                    start_idx = buffer.find(SOI)
+                    if start_idx == -1:
+                        if len(buffer) > 32768:
+                            buffer.clear()
+                        break
+
+                    end_idx = buffer.find(EOI, start_idx + 2)
+                    if end_idx == -1:
+                        if start_idx > 0:
+                            del buffer[:start_idx]
+                        break
+
+                    frame_bytes = bytes(buffer[start_idx:end_idx + 2])
+                    del buffer[:end_idx + 2]
+
+                    b64_str = base64.b64encode(frame_bytes).decode("ascii")
+                    frame_url = f"data:image/jpeg;base64,{b64_str}"
+                    await websocket.send_text(frame_url)
+                    await asyncio.sleep(target_interval * 0.5)
+
+        pipe_task = asyncio.create_task(socket_to_ffmpeg())
+        out_task = asyncio.create_task(ffmpeg_to_websocket())
+
+        done, pending = await asyncio.wait([pipe_task, out_task], return_when=asyncio.FIRST_EXCEPTION)
+        for t in pending:
+            t.cancel()
 
     finally:
-        _is_worker_running = False
+        if client_writer:
+            try:
+                client_writer.close()
+                await client_writer.wait_closed()
+            except Exception:
+                pass
+        if ffmpeg_proc:
+            try:
+                ffmpeg_proc.terminate()
+                await asyncio.sleep(0.1)
+                if ffmpeg_proc.returncode is None:
+                    ffmpeg_proc.kill()
+            except Exception:
+                pass
+        if scrcpy_proc:
+            try:
+                scrcpy_proc.terminate()
+                await asyncio.sleep(0.1)
+                if scrcpy_proc.returncode is None:
+                    scrcpy_proc.kill()
+            except Exception:
+                pass
+
+        try:
+            p_rm = await asyncio.create_subprocess_exec(
+                adb_path, "-s", device_id, "forward", "--remove", f"tcp:{local_port}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=creation_flags
+            )
+            await p_rm.wait()
+        except Exception:
+            pass
 
 
-async def stream_emulator_frames(websocket: WebSocket, fps: int = 30, target_device_id: Optional[str] = None):
+async def stream_emulator_frames_polling(websocket: WebSocket, fps: int = 30, target_device_id: Optional[str] = None):
     """
-    Streams Android screen frames continuously over WebSocket to the client for target_device_id or default active device.
+    Fallback screenshot-polling frame streamer (used if scrcpy/ffmpeg are unavailable).
     """
     adb_path = find_adb_executable()
     if not adb_path:
@@ -706,7 +901,59 @@ async def stream_emulator_frames(websocket: WebSocket, fps: int = 30, target_dev
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[WS Emulator Stream Error] {e}")
+        print(f"[WS Fallback Stream Error] {e}")
+
+
+async def stream_emulator_frames(websocket: WebSocket, fps: int = 30, target_device_id: Optional[str] = None):
+    """
+    Main emulator streaming entry point. Attempts low-latency scrcpy-server + ffmpeg stream first,
+    and falls back cleanly to screenshot polling if scrcpy/ffmpeg are unavailable or fail.
+    """
+    jar = find_scrcpy_server_jar()
+    ffmpeg_bin = find_ffmpeg_executable()
+
+    if jar and ffmpeg_bin:
+        try:
+            print(f"[STREAMING] Starting scrcpy-server H.264 real video stream (jar={jar}, ffmpeg={ffmpeg_bin})")
+            await stream_scrcpy_video_frames(websocket, fps=fps, target_device_id=target_device_id)
+            return
+        except WebSocketDisconnect:
+            return
+        except Exception as scrcpy_err:
+            print(f"[STREAMING WARNING] Scrcpy stream error: {scrcpy_err}. Falling back to screenshot polling.")
+
+    print("[STREAMING] Using screenshot polling fallback for live screen stream.")
+    await stream_emulator_frames_polling(websocket, fps=fps, target_device_id=target_device_id)
+
+
+async def generate_mjpeg_stream_async(target_device_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
+    """
+    Generates a continuous multipart/x-mixed-replace MJPEG byte stream for HTTP streaming endpoints.
+    """
+    adb_path = find_adb_executable()
+    if not adb_path:
+        return
+
+    while True:
+        device_id = await get_online_adb_device_async(adb_path, target_device_id=target_device_id)
+        if not device_id:
+            await asyncio.sleep(1.0)
+            continue
+
+        frame_url = await capture_and_compress_frame_async(adb_path, device_id)
+        if frame_url and frame_url.startswith("data:image/jpeg;base64,"):
+            try:
+                b64_data = frame_url.split(",", 1)[1]
+                jpeg_bytes = base64.b64decode(b64_data)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n"
+                )
+                await asyncio.sleep(0.033)
+            except Exception:
+                await asyncio.sleep(0.1)
+        else:
+            await asyncio.sleep(0.1)
 
 
 # ==============================================================================

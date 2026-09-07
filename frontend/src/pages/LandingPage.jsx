@@ -1,6 +1,25 @@
 import React, { useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { UploadCloud, FileArchive, CheckCircle2, AlertTriangle, ArrowRight, ShieldCheck, Sparkles, FolderTree, Cpu, Play, BookOpen, Clapperboard, X, FileText, Check } from 'lucide-react';
+import {
+  UploadCloud,
+  FileArchive,
+  CheckCircle2,
+  AlertTriangle,
+  ArrowRight,
+  ShieldCheck,
+  Sparkles,
+  FolderTree,
+  Cpu,
+  Play,
+  BookOpen,
+  Clapperboard,
+  X,
+  FileText,
+  Check,
+  Boxes,
+  Layers,
+  ArrowUpRight
+} from 'lucide-react';
 import { useProject } from '../context/ProjectContext.jsx';
 
 export default function LandingPage() {
@@ -16,7 +35,7 @@ export default function LandingPage() {
 
   const zipInputRef = useRef(null);
   const navigate = useNavigate();
-  const { setActiveProject, handleUploadSuccess } = useProject();
+  const { setActiveProject, handleUploadSuccess, projectsList, selectProject, showToast } = useProject();
 
   const supportedTechnologies = ['ZIP', 'Java', 'Python', 'JavaScript', 'TypeScript', 'Kotlin', 'C#'];
 
@@ -266,6 +285,62 @@ export default function LandingPage() {
           )}
         </div>
       </div>
+
+      {/* DISCOVERED WORKSPACE PROJECTS (Quick-Start Cards) */}
+      {projectsList && projectsList.length > 0 && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
+          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="p-1.5 rounded-lg bg-blue-50 text-blue-600">
+                <Boxes className="h-4 w-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Workspace Applications Ready to Execute</h3>
+                <p className="text-[11px] text-slate-500">Pick any detected test automation suite to launch directly into the workbench</p>
+              </div>
+            </div>
+            <span className="text-xs font-mono font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full border border-blue-100">
+              {projectsList.length} Active {projectsList.length === 1 ? 'Suite' : 'Suites'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            {projectsList.map((proj, idx) => (
+              <div
+                key={idx}
+                className="p-4 rounded-xl border border-slate-200 bg-slate-50/50 hover:bg-white hover:border-blue-300 hover:shadow-sm transition group flex flex-col justify-between space-y-3"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-1">
+                    <span className="text-xs font-extrabold text-slate-900 group-hover:text-blue-600 transition block truncate max-w-[220px]">
+                      {proj.project_name}
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-500">
+                      {proj.test_count ?? proj.test_files?.length ?? 0} automated tests detected
+                    </span>
+                  </div>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 uppercase shrink-0">
+                    {proj.framework_type || 'Custom'}
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await selectProject(proj);
+                    showToast(`Opened ${proj.project_name} in Workbench`, 'success');
+                    navigate('/dashboard');
+                  }}
+                  className="w-full py-2 px-3 rounded-lg bg-white group-hover:bg-blue-600 group-hover:text-white border border-slate-200 group-hover:border-blue-600 text-slate-700 text-xs font-semibold shadow-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                >
+                  <span>Launch in Workbench</span>
+                  <ArrowUpRight className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* PRODUCT TOUR CARD (Matching Screenshot 2 Bottom Card) */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
